@@ -15,8 +15,7 @@ venv/
 config.py
 *.local
 
-# Generated data and experiment artifacts
-data/
+# Generated experiment artifacts
 experiments/
 output/
 *.failed
