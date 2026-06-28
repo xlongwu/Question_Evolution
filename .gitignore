@@ -14,11 +14,15 @@ venv/
 .env.*
 config.py
 *.local
+.secrets/
+local_config*.json
+api_keys*.txt
 
 # Generated experiment artifacts
 experiments/
 output/
 *.failed
+*.log
 
 # OS/editor metadata
 .DS_Store

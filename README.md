@@ -8,102 +8,53 @@
 
 ## 1. 整体流程
 
-当前流水线准确流程是：
+当前推荐主流程由 `run_loop.sh` 编排，入口是已完成准入的
+`admitted_seed_samples.jsonl`。脚本仍保留旧输入回退，但正式实验应显式使用准入样本。
 
-  1. 原始题目 + 原始 reference + 原始 rubric + 原始 score_prompt
-     ↓
-  2. Qwen 回答原题，得到 candidate_answer
-     ↓
-  3. Judge 按 rubric/score_prompt 给 Qwen 的 candidate_answer 打分
-     当前默认 Judge 也是 Qwen
-     ↓
-  4. 挑选 Qwen 得分率 >= 0.8 的高分题
-     ↓
-  5. GPT-5.4 改写这些高分题，让题目更难
-     ↓
-  6. GPT-5.4 针对改写后的新题生成 reference
-     ↓
-  7. GPT-5.4 针对新题 + 新 reference 生成新 rubric 和新 score_prompt
-     ↓
-  8. Qwen 回答改写后的新题，得到新的 candidate_answer
-     ↓
-  9. Judge 再按新 rubric/score_prompt 给 Qwen 新答案打分
-
-  所以每轮产物关系是：
-
-  GPT 生成：
-  - evolved_prompt
-  - reference answer
-  - rubric
-  - score_prompt
-
-  Qwen 生成：
-  - 原题 candidate_answer
-  - 新题 candidate_answer
-
-  Judge 生成：
-  - scoring_result
-
-  当前代码里 Judge 默认也是 hjl_Qwen3.6-27B，所以可以理解
-  成：
-
-  Qwen 自己答题
-  Qwen 按 rubric 给自己的答案打分
-  GPT 负责把高分题升级并重建参考答案和评分标准
-  Qwen 再答新题并评分
-
-整个流水线包含 4 个脚本，执行顺序如下：
-
+```text
+Stage 0: admitted_seed_samples.jsonl
+Stage 1: scoring.py -> round_0/scored.jsonl
+Stage 2: profile_samples.py -> select_evolution_candidates.py
+Stage 3: operator_router.py -> question_evolution.py
+Stage 4: validate_evolved_question.py -> candidate_selection.py
+Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
+         -> analyze_evolution_effect.py -> update_sample_state.py
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 0: 原始数据 (已包含 prompt + reference + rubric)                        │
-│  data/police_qa_testset_v2.8.jsonl                                          │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 1: scoring.py  — 用候选模型(Qwen)答题并评分 (Qwen)                       │
-│  输入:  *.jsonl (含 prompt, rubric, score_prompt, meta_info.references)       │
-│  输出:  *_scored.jsonl (新增 scoring_result)                                  │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 2: question_evolution.py  — 对高分题目进行进化（gpt-5.4）                │
-│  输入:  *_scored.jsonl (含 scoring_result)                                    │
-│  输出:  *_evolved.jsonl (prompt 被改写, 旧评分产物移入 meta_info.stale_*)      │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 3: collect_answers.py  — 为进化后的题目重新采集参考答案(gpt-5.4)          │
-│  输入:  *_evolved.jsonl                                                       │
-│  输出:  *_with_answers.jsonl (meta_info.references 被覆盖为新 reference)       │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 4: gen_rubric.py  — 针对新题和新 reference 生成 rubric (gpt-5.4)         │
-│  输入:  *_with_answers.jsonl                                                  │
-│  输出:  *_rubric.jsonl (新增 rubric, score_prompt)                            │
-└─────────────────────────────────┬───────────────────────────────────────────┘
-                                  │
-                                  ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  阶段 5: scoring.py  — 再次用候选模型(Qwen)答题并评分，验证进化效果              │
-│  输入:  *_rubric.jsonl                                                        │
-│  输出:  *_rubric_scored.jsonl (新增 scoring_result)                           │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+
+从 Round 1 开始，每轮 11 个步骤与 `run_loop.sh` 保持一致：
+
+| 步骤 | 脚本 | 产物 |
+| --- | --- | --- |
+| 0 | 复制上一轮 scored/state 输入 | `round_N/input.jsonl` |
+| 1 | `profile_samples.py` | `profiled.jsonl` |
+| 2 | `select_evolution_candidates.py` | `profiled_candidates.jsonl` |
+| 3 | `operator_router.py` | `routed.jsonl` |
+| 4 | `question_evolution.py` | `candidates.jsonl` |
+| 5 | `validate_evolved_question.py` | `validated_candidates.jsonl` |
+| 6 | `candidate_selection.py` | `evolved.jsonl` |
+| 7 | `collect_answers.py` | `with_answers.jsonl` |
+| 8 | `gen_rubric.py` | `rubric.jsonl` |
+| 9 | `scoring.py` | `scored.jsonl` |
+| 10 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl` |
+| 11 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
+
+`question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、候选选择、效果统计和状态更新。
 
 ### 1.1 脚本职责速查
 
 | 脚本 | 职责 | 典型输入 | 典型输出 |
 | --- | --- | --- | --- |
-| `scoring.py` | 调用候选模型生成答案，并用评分模型按 rubric 打分 | `*_rubric.jsonl` | `*_scored.jsonl` |
-| `question_evolution.py` | 筛选高分题目，调用强模型把题目改得更难 | `*_scored.jsonl` | `*_evolved.jsonl` |
+| `scoring.py` | 调用候选模型生成答案，并用评分模型按 rubric 打分 | `*.jsonl` | `*_scored.jsonl` |
+| `profile_samples.py` | 生成样本画像和虚高诊断 | `*_scored.jsonl` | `profiled.jsonl` |
+| `select_evolution_candidates.py` | 输出 `evolution_action`，区分进化、低分重构、透传和停止 | `profiled.jsonl` | `profiled_candidates.jsonl` |
+| `operator_router.py` | 根据画像、状态和 memory 选择 operator | `profiled_candidates.jsonl` | `routed.jsonl` |
+| `question_evolution.py` | 按 operator 生成 1-4 个候选题，支持 validate-retry | `routed.jsonl` | `candidates.jsonl` |
+| `validate_evolved_question.py` | 校验复杂度、可回答性、重复题型和格式风险 | `candidates.jsonl` | `validated_candidates.jsonl` |
+| `candidate_selection.py` | 从局部树状探索候选中选择主链题目 | `validated_candidates.jsonl` | `evolved.jsonl` |
 | `collect_answers.py` | 调用强模型为题目生成参考答案 | `*.jsonl` | `*_with_answers.jsonl` |
 | `gen_rubric.py` | 根据题目和参考答案生成 rubric 与 score_prompt | `*_with_answers.jsonl` | `*_rubric.jsonl` |
+| `analyze_evolution_effect.py` | 统计轻量边界命中和 operator 效果矩阵 | `*_scored.jsonl` | `effect_analysis.jsonl` |
+| `update_sample_state.py` | 更新跨轮状态并写入三类 memory bank | `effect_analysis.jsonl` | `state_updated.jsonl` |
 
 ---
 
@@ -113,7 +64,7 @@
 
 ### 2.1 阶段 0：原始数据
 
-以 `data/police_qa_testset_v2.8.jsonl` 为例，每行至少包含：
+推荐入口是 `admitted_seed_samples.jsonl`，每行至少包含：
 
 ```json
 {
@@ -151,7 +102,7 @@
 | `rubric[].description` | string | 评分细则 |
 | `rubric[].weight` | int | 该项满分/扣分值 |
 | `rubric_thought_process` | string | 生成 rubric 时的设计思路 |
-| `score_prompt` | string | 给评分模型的完整提示词，其中 `<<<待评答案>>>` 为占位符 |
+| `score_prompt` | string | 给评分模型的完整提示词，其中 `<<<待评答案>>` 为占位符 |
 
 ---
 
@@ -204,24 +155,22 @@
 score_rate = scoring_result.total_awarded / scoring_result.total_possible
 ```
 
-`question_evolution.py` 默认对 `score_rate >= 0.8` 的题目进行进化。
+新版主流程优先读取 `evolution_action` 决定是否进化；legacy 单脚本路径才继续使用 `score_rate >= 0.8` 作为触发条件。
 
 ---
 
-### 2.3 阶段 2：`question_evolution.py` 输出
+### 2.3 主流程中间字段：画像、路由、进化、校验和候选选择
 
-这是本套程序的核心。它会：
+当前主流程不是直接把高分题送入统一 prompt，而是依次补充：
 
-1. **全量输出**所有样本；
-2. 对 `score_rate >= --min-score-rate` 的样本：
-   - 把原 `prompt` 移到 `meta_info.prompt_old`；
-   - 把 `prompt` 替换为模型生成的 `evolved_prompt`；
-   - 把原 `rubric` / `score_prompt` / `scoring_result` 移到 `meta_info.stale_*`；
-   - 新增 `meta_info.question_evolution_metadata`；
-   - 顶层新增 `question_evolved: true`。
-3. 对未触发进化的样本：
-   - 原样透传；
-   - 顶层新增 `question_evolved: false`。
+1. `profile_samples.py`：新增 `sample_profile` 与 `overscore_diagnosis`。
+2. `select_evolution_candidates.py`：新增 `evolution_action`。
+3. `operator_router.py`：新增 `operator_route`。
+4. `question_evolution.py`：按 operator 生成候选题，新增 `candidate_group_id`、`candidate_id`、`candidate_operator`、`candidate_generation` 和 `meta_info.question_evolution_metadata`。
+5. `validate_evolved_question.py`：新增 `validation_result`，可包含 LLM/mock 校验字段 `main_axis_clear`、`answerable`、`external_knowledge_required`、`repeated_pattern_with_previous_round`、`format_difficulty_dominant`。
+6. `candidate_selection.py`：在选中记录上新增 `candidate_selection`。
+
+`question_evolution.py` 在需要进化时会把原 `prompt` 移到 `meta_info.prompt_old`，并把旧 `rubric` / `score_prompt` / `scoring_result` 移到 `meta_info.stale_*`；透传样本会保留 `question_evolved=false`。
 
 > 为什么要把 rubric/score_prompt/scoring_result 移走？因为 `prompt` 变了，旧的 rubric 和评分结果已经失效，必须重新生成。
 
@@ -274,7 +223,7 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 
 ---
 
-### 2.4 阶段 3：`collect_answers.py` 输出
+### 2.4 标准闭环：`collect_answers.py` 输出
 
 `collect_answers.py` 会调用强模型（默认 GPT-5.4）为每个 `prompt` 生成参考答案，并覆盖 `meta_info.references`。
 
@@ -300,11 +249,11 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 
 ---
 
-### 2.5 阶段 4：`gen_rubric.py` 输出
+### 2.5 标准闭环：`gen_rubric.py` 输出
 
 `gen_rubric.py` 读取 `meta_info.references[0]` 作为参考答案，为新的 `prompt` 生成 rubric。
 
-输出会在阶段 3 的基础上新增：
+输出会在 `collect_answers.py` 的基础上新增：
 
 ```json
 {
@@ -321,9 +270,9 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 
 ---
 
-### 2.6 阶段 5：第二次 `scoring.py` 输出
+### 2.6 标准闭环：第二次 `scoring.py` 输出
 
-与阶段 1 相同，再次用候选模型（Qwen）回答新题，并用评分模型打分。
+与 baseline scoring 相同，再次用候选模型（Qwen）回答新题，并用评分模型打分。
 
 ```json
 {
@@ -344,28 +293,25 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 }
 ```
 
-通过对比 `meta_info.stale_scoring_result` 和新的 `scoring_result`，即可判断题目进化是否有效：理想情况下，新题的候选模型得分率应显著下降。
+随后 `analyze_evolution_effect.py` 会新增 `effect_analysis`，`update_sample_state.py` 会新增下一轮使用的 `evolution_state`，并把有效、失败和无效生成经验写入 `memory/`。
 
 ---
 
 ## 3. 字段流转总表
 
-| 字段 | 阶段 0 原始数据 | 阶段 1 scoring | 阶段 2 question_evolution | 阶段 3 collect_answers | 阶段 4 gen_rubric | 阶段 5 scoring |
+| 字段 | Stage 0 输入 | scoring | profile/select/router | evolution/validation/selection | standard closure | effect/state |
 | --- | --- | --- | --- | --- | --- | --- |
-| `index` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| `prompt` | 原题 | 原题 | **可能改写为 evolved_prompt** | evolved_prompt | evolved_prompt | evolved_prompt |
-| `meta_info.references` | 原参考答案 | 不变 | 不变（但已失效） | **覆盖为新参考答案** | 不变 | 不变 |
-| `meta_info.prompt_old` | 无 | 无 | **新增** | 保留 | 保留 | 保留 |
-| `meta_info.stale_rubric` | 无 | 无 | **新增（原 rubric 移入）** | 保留 | 保留 | 保留 |
-| `meta_info.stale_score_prompt` | 无 | 无 | **新增** | 保留 | 保留 | 保留 |
-| `meta_info.stale_scoring_result` | 无 | 无 | **新增** | 保留 | 保留 | 保留 |
-| `meta_info.question_evolution_metadata` | 无 | 无 | **新增** | 保留 | 保留 | 保留 |
-| `rubric` | ✓ | ✓ | **被移走** | 无 | **重新生成** | ✓ |
-| `score_prompt` | ✓ | ✓ | **被移走** | 无 | **重新生成** | ✓ |
-| `scoring_result` | 无 | **新增** | **被移走** | 无 | 无 | **重新生成** |
-| `question_evolved` | 无 | 无 | **新增** | 无（丢失） | 无 | 无 |
+| `index` / `sample_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `prompt` | 原题 | 原题 | 原题 | 可能改写为候选/选中题 | 新题 | 新题 |
+| `sample_profile` / `overscore_diagnosis` | 无 | 无 | 新增 | 保留 | 保留 | 保留 |
+| `evolution_action` / `operator_route` | 无 | 无 | 新增 | 消费并保留 | 保留 | 保留 |
+| `meta_info.question_evolution_metadata` | 无 | 无 | 无 | 新增 | 保留 | 保留 |
+| `validation_result` / `candidate_selection` | 无 | 无 | 无 | 新增 | 保留 | 保留 |
+| `rubric` / `score_prompt` | ✓ | ✓ | ✓ | 进化题移入 stale | 重新生成 | ✓ |
+| `scoring_result` | 无 | 新增 | 保留 | 进化题移入 stale | 重新生成 | ✓ |
+| `effect_analysis` / `evolution_state` | 无 | 无 | 可继承上一轮 | 可继承上一轮 | 无 | 新增 |
 
-> 注：`collect_answers.py` 会丢弃顶层非 `meta_info` 字段。如需在阶段 3 后继续知道哪些题被进化过，请读取 `meta_info.question_evolution_metadata.question_evolved`。
+> 注：标准闭环脚本可能只保留部分顶层字段；需要跨阶段稳定消费的进化信息应读取 `meta_info.question_evolution_metadata`、`validation_result`、`candidate_selection`、`effect_analysis` 和 `evolution_state`。
 
 ---
 
@@ -373,7 +319,51 @@ score_rate = scoring_result.total_awarded / scoring_result.total_possible
 
 ### 4.1 单轮运行
 
-当前仓库没有单独维护 `run.sh`。如需单轮验证，请按下方 **4.3 分步运行** 依次执行阶段 1 到阶段 5；如需自动循环多轮，请直接使用 `run_loop.sh`。
+先创建本地环境并安装依赖：
+
+```bash
+python -m venv .venv
+pip install -r requirements.txt
+```
+
+真实运行前至少配置以下环境变量之一：
+
+```bash
+# profile/question evolution/answer/rubric 可共用 OpenAI-compatible 配置
+export OPENAI_BASE_URL="https://your-openai-compatible-endpoint/v1"
+export OPENAI_API_KEY="..."
+
+# 如需拆分配置，可分别设置
+export PROFILE_API_KEYS="..."
+export EVOLVE_API_KEYS="..."
+export ANSWER_API_KEYS="..."
+export RUBRIC_API_KEYS="..."
+
+# 候选模型与 judge
+export QWEN_BASE_URL="http://127.0.0.1:18011/v1"
+export QWEN_API_KEY=""
+export QWEN_MODEL="hjl_Qwen3.6-27B"
+```
+
+如果你更习惯原来的明文 Python 配置方式，可以直接在本地 `config.py` 中填写：
+
+```python
+BASE_URL = "https://hanbbq.labpilot.top/v1"
+GPT_MODEL = "gpt-5.4"
+HIAPI_KEYS_BIG = ["REPLACE_WITH_YOUR_LOCAL_KEY"]
+
+QWEN_BASE_URL = "http://127.0.0.1:18011/v1"
+QWEN_API_KEY = ""
+QWEN_MODEL = "hjl_Qwen3.6-27B"
+```
+
+`config.py` 已被 `.gitignore` 忽略，脚本会按 `CLI 非空参数 > 环境变量 > config.py > 默认值` 的顺序读取配置。Qwen 本地服务不需要 key 时保持空字符串即可，`scoring.py` 会在 OpenAI SDK 需要参数时内部使用占位值。不要把真实 strong-model API key 写回受版本控制的源码文件；已经暴露过的 key 应在服务端人工轮换。
+
+真实 Bash/API 验收前可先运行预检：
+
+```bash
+python check_runtime_environment.py
+```
 
 ### 4.2 多轮循环运行（推荐）
 
@@ -385,25 +375,39 @@ bash run_loop.sh
 
 默认配置：
 
-- 最大轮数：`MAX_ROUNDS=20`
+- 最大轮数：`MAX_ROUNDS=5`
 - 提前停止阈值：`EARLY_STOP_RATE=0.5`（当某轮 Qwen 平均得分率 < 50% 时停止）
 - 每轮触发进化的阈值：`MIN_SCORE_RATE=0.8`
+- 每条样本最多候选：`NUM_CANDIDATES=2`
+- 单轮候选总预算：`MAX_CANDIDATE_BUDGET=0`，表示自动使用待进化样本数 × 2
 
-每轮结果保存在 `exp/round_N/` 子文件夹中：
+每轮结果保存在 `experiments/YYYY-MM-DD/exp*/round_N/` 子文件夹中：
 
 ```text
-exp/
+experiments/YYYY-MM-DD/exp/
 ├── round_0/
-│   ├── input.jsonl       # 初始输入（从 data/police_qa_testset_v2.8.jsonl 复制）
+│   ├── input.jsonl       # 初始输入（从 admitted_seed_samples.jsonl 复制）
 │   └── scored.jsonl      # 初始 baseline 评分结果
 ├── round_1/
-│   ├── input.jsonl       # 复制自 round_0/scored.jsonl
-│   ├── evolved.jsonl     # question_evolution 输出
+│   ├── input.jsonl
+│   ├── profiled.jsonl
+│   ├── profiled_candidates.jsonl
+│   ├── routed.jsonl
+│   ├── candidates.jsonl
+│   ├── validated_candidates.jsonl
+│   ├── evolved.jsonl
 │   ├── with_answers.jsonl
 │   ├── rubric.jsonl
-│   └── scored.jsonl      # 本轮复测结果
+│   ├── scored.jsonl
+│   ├── effect_analysis.jsonl
+│   ├── effect_matrix.jsonl
+│   └── state_updated.jsonl
 ├── round_2/
 │   └── ...
+├── memory/
+│   ├── operator_memory_bank.jsonl
+│   ├── failure_memory_bank.jsonl
+│   └── invalid_generation_cases.jsonl
 ├── summary.txt           # 各轮平均得分率汇总
 └── final/
     └── final_scored.jsonl
@@ -426,55 +430,110 @@ Round | Avg Score Rate | Status
 直接编辑 `run_loop.sh` 顶部的配置区即可：
 
 ```bash
-MAX_ROUNDS=20
+MAX_ROUNDS=5
 EARLY_STOP_RATE=0.5
 MIN_SCORE_RATE=0.8
+NUM_CANDIDATES=2
+MAX_CANDIDATE_BUDGET=0
+VALIDATION_RETRIES=1
 ```
 
 ### 4.3 分步运行
 
 ```bash
-# 阶段 1：用 Qwen 对现有题目答题并评分
+# Round 0：baseline 评分
 python scoring.py \
-  --input data/police_qa_testset_v2.8.jsonl \
-  --output data/questions_rubric_scored.jsonl \
+  --input admitted_seed_samples.jsonl \
+  --output round_0_scored.jsonl \
   --answer-mode llm \
-  --answer-base-url http://127.0.0.1:18011/v1 \
-  --answer-api-key "" \
-  --answer-model hjl_Qwen3.6-27B \
-  --concurrency 30
+  --answer-base-url "$QWEN_BASE_URL" \
+  --answer-api-key "$QWEN_API_KEY" \
+  --answer-model "$QWEN_MODEL" \
+  --judge-base-url "$QWEN_BASE_URL" \
+  --judge-api-key "$QWEN_API_KEY" \
+  --judge-model "$QWEN_MODEL"
 
-# 阶段 2：对得分率 >= 0.8 的题目进化
+# Step 1：画像
+python profile_samples.py \
+  --input round_0_scored.jsonl \
+  --output round_1_profiled.jsonl \
+  --model "$PROFILE_MODEL" \
+  --base-url "$PROFILE_BASE_URL"
+
+# Step 2：候选分流
+python select_evolution_candidates.py \
+  --input round_1_profiled.jsonl \
+  --output round_1_profiled_candidates.jsonl \
+  --high-score-threshold 0.8
+
+# Step 3：算子路由
+python operator_router.py \
+  --input round_1_profiled_candidates.jsonl \
+  --output round_1_routed.jsonl \
+  --memory-dir memory
+
+# Step 4：多候选进化，含 validate-retry
 python question_evolution.py \
-  --input data/questions_rubric_scored.jsonl \
-  --output data/questions_evolved.jsonl \
+  --input round_1_routed.jsonl \
+  --output round_1_candidates.jsonl \
   --min-score-rate 0.8 \
-  --concurrency 20
+  --model "$EVOLVE_MODEL" \
+  --base-url "$EVOLVE_BASE_URL" \
+  --num-candidates 2 \
+  --max-candidate-budget 0 \
+  --validation-retries 1
 
-# 阶段 3：为进化后的题目重新采集参考答案
+# Step 5：复杂度/可回答性校验
+python validate_evolved_question.py \
+  --input round_1_candidates.jsonl \
+  --output round_1_validated_candidates.jsonl \
+  --validate-schema
+
+# Step 6：候选选择
+python candidate_selection.py \
+  --input round_1_validated_candidates.jsonl \
+  --output round_1_evolved.jsonl \
+  --invalid-output round_1_invalid_generation_cases.jsonl
+
+# Step 7：采集参考答案
 python collect_answers.py \
-  --input data/questions_evolved.jsonl \
-  --output data/questions_evolved_with_answers.jsonl \
-  --concurrency 100 \
+  --input round_1_evolved.jsonl \
+  --output round_1_with_answers.jsonl \
   --samples 1 \
-  --model gpt-5.4
+  --model "$GPT_MODEL" \
+  --base-url "$ANSWER_BASE_URL"
 
-# 阶段 4：重新生成 rubric
+# Step 8：重新生成 rubric
 python gen_rubric.py \
-  --input data/questions_evolved_with_answers.jsonl \
-  --output data/questions_evolved_rubric.jsonl \
-  --concurrency 30 \
-  --model gpt-5.4
+  --input round_1_with_answers.jsonl \
+  --output round_1_rubric.jsonl \
+  --model "$GPT_MODEL" \
+  --base-url "$RUBRIC_BASE_URL"
 
-# 阶段 5：再次用 Qwen 答题并评分，验证进化效果
+# Step 9：再次评分
 python scoring.py \
-  --input data/questions_evolved_rubric.jsonl \
-  --output data/questions_evolved_rubric_scored.jsonl \
+  --input round_1_rubric.jsonl \
+  --output round_1_scored.jsonl \
   --answer-mode llm \
-  --answer-base-url http://127.0.0.1:18011/v1 \
-  --answer-api-key "" \
-  --answer-model hjl_Qwen3.6-27B \
-  --concurrency 30
+  --answer-base-url "$QWEN_BASE_URL" \
+  --answer-api-key "$QWEN_API_KEY" \
+  --answer-model "$QWEN_MODEL" \
+  --judge-base-url "$QWEN_BASE_URL" \
+  --judge-api-key "$QWEN_API_KEY" \
+  --judge-model "$QWEN_MODEL"
+
+# Step 10：效果统计
+python analyze_evolution_effect.py \
+  --before round_0_scored.jsonl \
+  --input round_1_scored.jsonl \
+  --output round_1_effect_analysis.jsonl \
+  --matrix-output round_1_effect_matrix.jsonl
+
+# Step 11：状态更新和 memory bank 写入
+python update_sample_state.py \
+  --input round_1_effect_analysis.jsonl \
+  --output round_1_state_updated.jsonl \
+  --memory-dir memory
 ```
 
 ---
@@ -483,12 +542,12 @@ python scoring.py \
 
 ### Q1：如何只看哪些题目被进化了？
 
-阶段 2 的输出中，过滤 `question_evolved == true`：
+`candidate_selection.py` 之后的 `evolved.jsonl` 或标准闭环后的记录中，过滤 `question_evolved == true`：
 
 ```python
 import json
 
-with open("data/questions_evolved.jsonl", "r", encoding="utf-8") as f:
+with open("round_1_evolved.jsonl", "r", encoding="utf-8") as f:
     for line in f:
         item = json.loads(line)
         if item.get("question_evolved"):
@@ -497,9 +556,9 @@ with open("data/questions_evolved.jsonl", "r", encoding="utf-8") as f:
             print()
 ```
 
-### Q2：阶段 3 之后如何知道哪些题是进化过的？
+### Q2：标准闭环之后如何知道哪些题是进化过的？
 
-阶段 3 会丢弃顶层 `question_evolved`，但保留了 `meta_info.question_evolution_metadata`：
+部分标准闭环脚本可能丢弃顶层 `question_evolved`，但会保留 `meta_info.question_evolution_metadata`：
 
 ```python
 if item["meta_info"].get("question_evolution_metadata", {}).get("question_evolved"):
@@ -547,24 +606,43 @@ python scoring.py \
   --answer-base-url URL \
   --answer-api-key KEY \
   --answer-model MODEL \
+  --judge-base-url URL \
+  --judge-api-key KEY \
   --judge-model MODEL \
   --concurrency N \
   --retries N
+```
+
+### profile / select / router
+
+```bash
+python profile_samples.py --input scored.jsonl --output profiled.jsonl --model "$PROFILE_MODEL" --base-url "$PROFILE_BASE_URL"
+python select_evolution_candidates.py --input profiled.jsonl --output profiled_candidates.jsonl --high-score-threshold 0.8
+python operator_router.py --input profiled_candidates.jsonl --output routed.jsonl --memory-dir memory
 ```
 
 ### question_evolution.py
 
 ```bash
 python question_evolution.py \
-  --input INPUT_scored.jsonl \
-  --output OUTPUT_evolved.jsonl \
+  --input routed.jsonl \
+  --output candidates.jsonl \
   --min-score-rate 0.8 \
   --model gpt-5.4 \
-  --base-url https://hanbbq.labpilot.top/v1 \
-  --api-key <API_KEY> \
+  --base-url "$EVOLVE_BASE_URL" \
   --concurrency 20 \
   --retries 3 \
-  --prompt-version {v1,v2}
+  --prompt-version {v1,v2} \
+  --num-candidates 2 \
+  --max-candidate-budget 0 \
+  --validation-retries 1
+```
+
+### validate / select
+
+```bash
+python validate_evolved_question.py --input candidates.jsonl --output validated_candidates.jsonl --validate-schema
+python candidate_selection.py --input validated_candidates.jsonl --output evolved.jsonl --invalid-output invalid_generation_cases.jsonl
 ```
 
 ### collect_answers.py
@@ -576,6 +654,7 @@ python collect_answers.py \
   --samples 1 \
   --concurrency 100 \
   --model gpt-5.4 \
+  --base-url "$ANSWER_BASE_URL" \
   --retries 3
 ```
 
@@ -587,7 +666,15 @@ python gen_rubric.py \
   --output OUTPUT_rubric.jsonl \
   --concurrency 30 \
   --model gpt-5.4 \
+  --base-url "$RUBRIC_BASE_URL" \
   --prompt-version v4
+```
+
+### effect / state
+
+```bash
+python analyze_evolution_effect.py --before previous_scored.jsonl --input scored.jsonl --output effect_analysis.jsonl --matrix-output effect_matrix.jsonl
+python update_sample_state.py --input effect_analysis.jsonl --output state_updated.jsonl --memory-dir memory
 ```
 
 ---

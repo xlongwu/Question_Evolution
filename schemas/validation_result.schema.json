@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Validation Result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["passed"],
+  "properties": {
+    "passed": {
+      "type": "boolean"
+    },
+    "main_axis_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "new_facts_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "output_tasks_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "candidate_options_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "counterfactual_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "estimated_prompt_chars": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "external_knowledge_risk": {
+      "enum": ["low", "medium", "high"]
+    },
+    "format_difficulty_risk": {
+      "enum": ["low", "medium", "high"]
+    },
+    "repeat_pattern_risk": {
+      "enum": ["low", "medium", "high"]
+    },
+    "why_passed": {
+      "type": "string"
+    },
+    "reject_reason": {
+      "type": ["string", "null"]
+    },
+    "reject_reasons": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "invalid_type": {
+      "type": ["string", "null"]
+    },
+    "llm_validation_used": {
+      "type": "boolean"
+    },
+    "main_axis_clear": {
+      "type": "boolean"
+    },
+    "answerable": {
+      "type": "boolean"
+    },
+    "external_knowledge_required": {
+      "type": "boolean"
+    },
+    "repeated_pattern_with_previous_round": {
+      "type": "boolean"
+    },
+    "format_difficulty_dominant": {
+      "type": "boolean"
+    },
+    "llm_validation_reason": {
+      "type": "string"
+    }
+  }
+}

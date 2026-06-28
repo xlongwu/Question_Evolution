@@ -1,30 +1,45 @@
-# question_evolution.py
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
 
-from openai import AsyncOpenAI
+from prompts.operators import build_operator_prompt, get_operator_spec
+from select_evolution_candidates import (
+    EVOLVE_HIGH_SCORE_OVERSCORE,
+    PASS_THROUGH_OR_SCORING_NOISE,
+    RECONSTRUCT_LOW_SCORE_BOUNDARY,
+    STOP_EVOLUTION,
+)
+from local_api_config import get_config_list, get_config_value
+import validate_evolved_question as validation_stage
 
 
-def _env_list(name: str) -> List[str]:
-    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
-
-
-# Defaults can be overridden through CLI flags or environment variables.
-EVOLVE_MODEL = os.getenv("EVOLVE_MODEL", "gpt-5.4")
-EVOLVE_BASE_URL = os.getenv("EVOLVE_BASE_URL", "https://api.openai.com/v1")
-EVOLVE_API_KEYS = (
-    _env_list("EVOLVE_API_KEYS")
-    or _env_list("OPENAI_API_KEYS")
-    or _env_list("OPENAI_API_KEY")
+# 默认使用与 rubric_evolution 相同的 strong model，可通过 CLI 或环境变量覆盖。
+EVOLVE_MODEL = (
+    os.getenv("EVOLVE_MODEL")
+    or get_config_value("EVOLVE_MODEL", "QA_MODEL", "GPT_MODEL", default="gpt-5.4")
+)
+EVOLVE_BASE_URL = (
+    os.getenv("EVOLVE_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or get_config_value("EVOLVE_BASE_URL", "BASE_URL", "OPENAI_BASE_URL", default="https://hanbbq.labpilot.top/v1")
 )
 
 REQUEST_TIMEOUT_SECONDS = 180.0
 MAX_OUTPUT_TOKENS = 32768
+DEFAULT_MAX_VALIDATION_RETRIES = 1
+EVOLUTION_REQUIRED_ACTIONS = {
+    EVOLVE_HIGH_SCORE_OVERSCORE,
+    RECONSTRUCT_LOW_SCORE_BOUNDARY,
+}
+NON_EVOLUTION_ACTIONS = {
+    PASS_THROUGH_OR_SCORING_NOISE,
+    STOP_EVOLUTION,
+}
 
 
 logging.basicConfig(
@@ -32,6 +47,38 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
+    if cli_keys:
+        keys = [key.strip() for key in cli_keys if key and key.strip()]
+        if keys:
+            return keys
+    raw = os.getenv("EVOLVE_API_KEYS") or os.getenv("OPENAI_API_KEYS") or os.getenv("OPENAI_API_KEY") or ""
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys
+    return get_config_list(
+        "EVOLVE_API_KEYS",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
+
+
+def append_validation_retry_instruction(user_prompt: str, reject_reason: Optional[str]) -> str:
+    reason = str(reject_reason or "").strip()
+    if not reason:
+        return user_prompt
+    return (
+        user_prompt.rstrip()
+        + "\n\n# 上一轮候选题未通过独立复杂度/可回答性校验\n"
+        + f"reject_reason: {reason}\n"
+        + "请继续使用同一个 operator，不要更换题型主轴；只修正上述问题后重新生成。"
+        + "新题必须可回答、单主轴、不过度依赖格式复杂度，也不得引入题干外知识。\n"
+    )
 
 #########################################################
 '''
@@ -315,12 +362,19 @@ class RotatingAPIClient:
         self._init_client()
 
     def _init_client(self):
+        try:
+            from openai import AsyncOpenAI
+        except ImportError as exc:
+            raise RuntimeError("Missing dependency: install openai to run question_evolution.py.") from exc
+
         current_key = self.api_keys[self.current_key_index]
-        self.client = AsyncOpenAI(
-            api_key=current_key,
-            base_url=self.base_url,
-            timeout=self.request_timeout
-        )
+        kwargs = {
+            "api_key": current_key,
+            "timeout": self.request_timeout,
+        }
+        if self.base_url:
+            kwargs["base_url"] = self.base_url
+        self.client = AsyncOpenAI(**kwargs)
         logger.info(
             f"使用 question evolution API Key [{self.current_key_index + 1}/{len(self.api_keys)}]: "
             f"{current_key[:8]}..."
@@ -477,7 +531,21 @@ def load_processed_keys(output_path: str) -> set:
     return processed_keys
 
 
+def _coerce_score_rate(value: Any) -> Optional[float]:
+    try:
+        score_rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= score_rate <= 1:
+        return score_rate
+    return None
+
+
 def get_score_rate(item: Dict[str, Any]) -> Optional[float]:
+    top_level_score_rate = _coerce_score_rate(item.get("score_rate"))
+    if top_level_score_rate is not None:
+        return top_level_score_rate
+
     scoring_result = item.get("scoring_result")
     if not isinstance(scoring_result, dict):
         return None
@@ -493,7 +561,150 @@ def get_score_rate(item: Dict[str, Any]) -> Optional[float]:
     return awarded / possible
 
 
+def _normalize_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def get_evolution_action(item: Dict[str, Any]) -> str:
+    return str(item.get("evolution_action", "") or "").strip()
+
+
+def uses_stage_action_contract(item: Dict[str, Any]) -> bool:
+    return bool(get_evolution_action(item))
+
+
+def action_requires_evolution(item: Dict[str, Any]) -> bool:
+    return get_evolution_action(item) in EVOLUTION_REQUIRED_ACTIONS
+
+
+def get_operator_route(item: Dict[str, Any]) -> Dict[str, Any]:
+    route = item.get("operator_route")
+    return route if isinstance(route, dict) else {}
+
+
+def get_evolution_state(item: Dict[str, Any]) -> Dict[str, Any]:
+    state = item.get("evolution_state")
+    return state if isinstance(state, dict) else {}
+
+
+def get_sample_profile(item: Dict[str, Any]) -> Dict[str, Any]:
+    profile = item.get("sample_profile")
+    return profile if isinstance(profile, dict) else {}
+
+
+def get_overscore_diagnosis(item: Dict[str, Any]) -> Dict[str, Any]:
+    diagnosis = item.get("overscore_diagnosis")
+    return diagnosis if isinstance(diagnosis, dict) else {}
+
+
+def resolve_operator_id(item: Dict[str, Any]) -> str:
+    action = get_evolution_action(item)
+    if action not in EVOLUTION_REQUIRED_ACTIONS:
+        raise ValueError(f"evolution_action={action or '<missing>'} does not require operator evolution")
+
+    route = get_operator_route(item)
+    if not route:
+        raise ValueError("缺少 operator_route；请先运行 operator_router.py")
+
+    operator_id = str(route.get("primary_operator") or "").strip()
+    if not operator_id:
+        raise ValueError("operator_route.primary_operator 不能为空")
+
+    get_operator_spec(operator_id)
+    return operator_id
+
+
+def get_candidate_group_id(item: Dict[str, Any]) -> str:
+    for field in ("sample_id", "index"):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    prompt = str(item.get("prompt", "") or "")
+    digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
+    return f"prompt_{digest}"
+
+
+def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) -> List[str]:
+    if max_candidates < 1:
+        raise ValueError("--num-candidates 必须大于等于 1")
+    if not uses_stage_action_contract(item):
+        return [resolve_operator_id(item)] if should_evolve(item, 0) else []
+    if not action_requires_evolution(item):
+        return []
+
+    route = get_operator_route(item)
+    if not route:
+        raise ValueError("缺少 operator_route；请先运行 operator_router.py")
+
+    avoid = {
+        str(operator).strip()
+        for operator in route.get("avoid_operators", [])
+        if isinstance(operator, str) and operator.strip()
+    }
+    candidates: List[str] = []
+    for operator_id in [route.get("primary_operator")] + list(route.get("backup_operators", [])):
+        if not isinstance(operator_id, str):
+            continue
+        operator_id = operator_id.strip()
+        if not operator_id or operator_id in avoid or operator_id in candidates:
+            continue
+        get_operator_spec(operator_id)
+        candidates.append(operator_id)
+        if len(candidates) >= max_candidates:
+            break
+
+    if not candidates:
+        raise ValueError("operator_route 未提供可用候选算子")
+    return candidates
+
+
+def make_passthrough_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(item)
+    result["question_evolved"] = False
+
+    meta_info = result.get("meta_info")
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+    else:
+        meta_info = dict(meta_info)
+
+    existing_metadata = meta_info.get("question_evolution_metadata")
+    if isinstance(existing_metadata, dict):
+        metadata = dict(existing_metadata)
+    else:
+        metadata = {}
+    metadata["question_evolved"] = False
+
+    score_rate = get_score_rate(item)
+    if score_rate is not None:
+        metadata.setdefault("trigger_score_rate", score_rate)
+
+    meta_info["question_evolution_metadata"] = metadata
+    result["meta_info"] = meta_info
+    return result
+
+
+def make_passthrough_candidate_record(item: Dict[str, Any], requested_candidates: int) -> Dict[str, Any]:
+    result = make_passthrough_record(item)
+    group_id = get_candidate_group_id(item)
+    result["candidate_group_id"] = group_id
+    result["candidate_id"] = f"{group_id}::pass_through"
+    result["candidate_generation"] = {
+        "candidate_index": 0,
+        "num_candidates_requested": requested_candidates,
+        "operator_id": None,
+        "operator_source": "pass_through",
+    }
+    return result
+
+
 def should_evolve(item: Dict[str, Any], min_score_rate: float) -> bool:
+    if uses_stage_action_contract(item):
+        return action_requires_evolution(item)
     score_rate = get_score_rate(item)
     if score_rate is None:
         return False
@@ -531,11 +742,30 @@ def get_candidate_answer(item: Dict[str, Any]) -> str:
     raise ValueError("缺少有效 scoring_result.candidate_answer")
 
 
-def build_evolution_prompt(item: Dict[str, Any], prompt_version: str = "v1") -> str:
+def build_evolution_prompt(
+    item: Dict[str, Any],
+    prompt_version: str = "v1",
+    operator_id: Optional[str] = None,
+    validation_reject_reason: Optional[str] = None,
+) -> str:
     prompt = item.get("prompt")
     rubric = item.get("rubric")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ValueError("缺少有效 prompt")
+
+    if operator_id:
+        user_prompt = build_operator_prompt(
+            operator_id,
+            prompt=prompt.strip(),
+            reference_answer=get_reference_answer(item),
+            candidate_answer=get_candidate_answer(item),
+            rubric=rubric if isinstance(rubric, list) else [],
+            sample_profile=get_sample_profile(item),
+            overscore_diagnosis=get_overscore_diagnosis(item),
+            evolution_state=get_evolution_state(item),
+            operator_route=get_operator_route(item),
+        )
+        return append_validation_retry_instruction(user_prompt, validation_reject_reason)
 
     replacements = {
         "{|prompt|}": prompt.strip(),
@@ -546,10 +776,80 @@ def build_evolution_prompt(item: Dict[str, Any], prompt_version: str = "v1") -> 
     user_prompt = get_evolution_prompt_template(prompt_version)
     for placeholder, value in replacements.items():
         user_prompt = user_prompt.replace(placeholder, value)
-    return user_prompt
+    return append_validation_retry_instruction(user_prompt, validation_reject_reason)
 
 
-def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rate: float, model: str) -> Dict[str, Any]:
+def build_validation_probe_record(item: Dict[str, Any], evolved: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(item)
+    original_prompt = str(item.get("prompt", "") or "").strip()
+    result["prompt"] = str(evolved.get("evolved_prompt", "") or "").strip()
+    result["question_evolved"] = True
+
+    meta_info = result.get("meta_info")
+    if not isinstance(meta_info, dict):
+        meta_info = {}
+    else:
+        meta_info = dict(meta_info)
+    meta_info.setdefault("prompt_old", original_prompt)
+
+    metadata = meta_info.get("question_evolution_metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+    metadata["question_evolved"] = True
+
+    complexity_budget = evolved.get("complexity_budget")
+    if isinstance(complexity_budget, dict):
+        metadata["complexity_budget"] = complexity_budget
+
+    operator_used = evolved.get("operator_used")
+    if isinstance(operator_used, str) and operator_used.strip():
+        metadata["operator_used"] = operator_used.strip()
+
+    meta_info["question_evolution_metadata"] = metadata
+    result["meta_info"] = meta_info
+    if isinstance(operator_used, str) and operator_used.strip():
+        result["candidate_operator"] = operator_used.strip()
+    return result
+
+
+def validate_evolved_result_against_stage_rules(
+    item: Dict[str, Any],
+    evolved: Dict[str, Any],
+) -> Dict[str, Any]:
+    probe = build_validation_probe_record(item, evolved)
+    return validation_stage.validate_record(probe)
+
+
+def enrich_evolution_result_with_operator(
+    evolved: Dict[str, Any],
+    item: Dict[str, Any],
+    operator_id: str,
+) -> Dict[str, Any]:
+    spec = get_operator_spec(operator_id)
+    route = get_operator_route(item)
+    diagnosis = get_overscore_diagnosis(item)
+    enriched = dict(evolved)
+    enriched.setdefault("operator_used", operator_id)
+    enriched.setdefault("ability_axis", spec.ability_axis)
+
+    target_failure = str(diagnosis.get("target_failure_mode", "") or "").strip()
+    cause = str(diagnosis.get("candidate_overscore_cause", "") or "").strip()
+    routing_reason = str(route.get("routing_reason", "") or "").strip()
+
+    if routing_reason:
+        enriched.setdefault("boundary_hypothesis", routing_reason)
+    if target_failure or cause:
+        enriched.setdefault("expected_qwen_failure", target_failure or cause)
+    if not _normalize_string_list(
+        enriched.get("expected_evaluation_focus", enriched.get("evaluation_focus"))
+    ):
+        enriched["expected_evaluation_focus"] = list(spec.default_evaluation_focus)
+    return enriched
+
+
+def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rate: Optional[float], model: str) -> Dict[str, Any]:
     """构造进化后的记录。注意：rubric/score_prompt/scoring_result 对已改变 prompt 的题目已失效，移到 meta_info 中保存。"""
     result = dict(item)
     original_prompt = str(item.get("prompt", "")).strip()
@@ -564,8 +864,9 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     meta_info["stale_score_prompt"] = result.pop("score_prompt", None)
     meta_info["stale_scoring_result"] = result.pop("scoring_result", None)
 
-    # 写入 question evolution 元数据
-    meta_info["question_evolution_metadata"] = {
+    # 写入 question evolution 元数据。expected_evaluation_focus 只保存在这里，
+    # 不传入 rubric 生成或评分 prompt。
+    metadata = {
         "question_evolved": True,
         "trigger_score_rate": score_rate,
         "question_evolution_model": model,
@@ -574,9 +875,60 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
         "question_evolution_raw_response": evolved.get("question_evolution_raw_response", ""),
     }
 
+    expected_evaluation_focus = _normalize_string_list(
+        evolved.get("expected_evaluation_focus", evolved.get("evaluation_focus"))
+    )
+    if expected_evaluation_focus:
+        metadata["expected_evaluation_focus"] = expected_evaluation_focus
+
+    for field in (
+        "operator_used",
+        "ability_axis",
+        "target_subclaim",
+        "boundary_hypothesis",
+        "expected_qwen_failure",
+    ):
+        value = evolved.get(field)
+        if isinstance(value, str) and value.strip():
+            metadata[field] = value.strip()
+
+    complexity_budget = evolved.get("complexity_budget")
+    if isinstance(complexity_budget, dict):
+        metadata["complexity_budget"] = complexity_budget
+
+    validation_retry = evolved.get("validation_retry")
+    if isinstance(validation_retry, dict):
+        metadata["validation_retry"] = validation_retry
+
+    meta_info["question_evolution_metadata"] = metadata
+
     result["prompt"] = evolved_prompt
     result["meta_info"] = meta_info
     result["question_evolved"] = True
+    return result
+
+
+def make_evolved_candidate_record(
+    item: Dict[str, Any],
+    evolved: Dict[str, Any],
+    score_rate: Optional[float],
+    model: str,
+    *,
+    candidate_index: int,
+    requested_candidates: int,
+    operator_id: Optional[str],
+) -> Dict[str, Any]:
+    result = make_evolved_record(item, evolved, score_rate, model)
+    group_id = get_candidate_group_id(item)
+    result["candidate_group_id"] = group_id
+    result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
+    result["candidate_operator"] = operator_id or evolved.get("operator_used")
+    result["candidate_generation"] = {
+        "candidate_index": candidate_index,
+        "num_candidates_requested": requested_candidates,
+        "operator_id": operator_id,
+        "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
+    }
     return result
 
 
@@ -588,7 +940,10 @@ class QuestionEvolutionProcessor:
         max_concurrent: int = 20,
         max_retries: int = 3,
         min_score_rate: float = 0.8,
-        prompt_version: str = "v1"
+        prompt_version: str = "v1",
+        num_candidates: int = 1,
+        max_validation_retries: int = DEFAULT_MAX_VALIDATION_RETRIES,
+        max_candidate_budget: int = 0,
     ):
         self.client = client
         self.model = model
@@ -597,9 +952,26 @@ class QuestionEvolutionProcessor:
         self.max_retries = max_retries
         self.min_score_rate = min_score_rate
         self.prompt_version = prompt_version
+        self.num_candidates = num_candidates
+        self.max_validation_retries = max(0, max_validation_retries)
+        self.max_candidate_budget = max_candidate_budget
 
-    async def evolve_once(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        user_prompt = build_evolution_prompt(item, self.prompt_version)
+    async def evolve_once(
+        self,
+        item: Dict[str, Any],
+        operator_id: Optional[str] = None,
+        validation_reject_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if operator_id:
+            get_operator_spec(operator_id)
+        elif uses_stage_action_contract(item):
+            operator_id = resolve_operator_id(item)
+        user_prompt = build_evolution_prompt(
+            item,
+            self.prompt_version,
+            operator_id=operator_id,
+            validation_reject_reason=validation_reject_reason,
+        )
         response = await self.client.chat_completions_create(
             model=self.model,
             messages=[
@@ -611,14 +983,24 @@ class QuestionEvolutionProcessor:
         content = extract_answer(response)
         original_prompt = str(item.get("prompt", "")).strip()
         evolved = parse_evolution_response(content)
-        validate_evolved_question(original_prompt, evolved["evolved_prompt"])
+        if operator_id:
+            evolved = enrich_evolution_result_with_operator(evolved, item, operator_id)
         evolved["question_evolution_raw_response"] = content
         return evolved
 
-    async def evolve_with_retry(self, item: Dict[str, Any]) -> Dict[str, Any]:
+    async def _evolve_once_with_model_retry(
+        self,
+        item: Dict[str, Any],
+        operator_id: Optional[str],
+        validation_reject_reason: Optional[str],
+    ) -> Dict[str, Any]:
         for attempt in range(self.max_retries + 1):
             try:
-                return await self.evolve_once(item)
+                return await self.evolve_once(
+                    item,
+                    operator_id=operator_id,
+                    validation_reject_reason=validation_reject_reason,
+                )
             except Exception as e:
                 logger.warning(
                     f"question 进化失败 (尝试 {attempt + 1}/{self.max_retries + 1}) "
@@ -634,17 +1016,150 @@ class QuestionEvolutionProcessor:
                     raise
         raise RuntimeError("question 进化重试逻辑异常退出")
 
+    async def evolve_with_retry(self, item: Dict[str, Any], operator_id: Optional[str] = None) -> Dict[str, Any]:
+        reject_reason: Optional[str] = None
+        first_reject_reason: Optional[str] = None
+        for validation_attempt in range(self.max_validation_retries + 1):
+            evolved = await self._evolve_once_with_model_retry(
+                item,
+                operator_id=operator_id,
+                validation_reject_reason=reject_reason,
+            )
+            validation_result = validate_evolved_result_against_stage_rules(item, evolved)
+            if validation_result.get("passed") is True:
+                if validation_attempt:
+                    evolved["validation_retry"] = {
+                        "attempts": validation_attempt,
+                        "max_validation_retries": self.max_validation_retries,
+                        "first_reject_reason": first_reject_reason,
+                        "final_reject_reason": None,
+                    }
+                return evolved
+
+            reject_reason = str(validation_result.get("reject_reason") or "未通过复杂度/可回答性校验").strip()
+            first_reject_reason = first_reject_reason or reject_reason
+            if validation_attempt < self.max_validation_retries:
+                logger.warning(
+                    "候选题未通过独立校验，将带 reject_reason 使用同一 operator 重试 "
+                    f"({validation_attempt + 1}/{self.max_validation_retries}) "
+                    f"index={item.get('index')} reason={reject_reason[:200]}"
+                )
+                continue
+
+            evolved["validation_retry"] = {
+                "attempts": validation_attempt,
+                "max_validation_retries": self.max_validation_retries,
+                "first_reject_reason": first_reject_reason,
+                "final_reject_reason": reject_reason,
+            }
+            return evolved
+
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
             if not should_evolve(item, self.min_score_rate):
                 # 未触发进化，原样输出，仅加标记
-                result = dict(item)
-                result["question_evolved"] = False
-                return result
+                return make_passthrough_record(item)
 
             score_rate = get_score_rate(item)
             evolved = await self.evolve_with_retry(item)
             return make_evolved_record(item, evolved, score_rate, self.model)
+
+    async def process_item_candidates(
+        self,
+        item: Dict[str, Any],
+        requested_candidates: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        async with self.semaphore:
+            candidate_count = requested_candidates or self.num_candidates
+            if not should_evolve(item, self.min_score_rate):
+                return [make_passthrough_candidate_record(item, candidate_count)]
+
+            score_rate = get_score_rate(item)
+            if uses_stage_action_contract(item):
+                operator_ids = resolve_candidate_operator_ids(item, candidate_count)
+            else:
+                operator_ids = [None]
+
+            candidates: List[Dict[str, Any]] = []
+            for candidate_index, operator_id in enumerate(operator_ids, start=1):
+                evolved = await self.evolve_with_retry(item, operator_id=operator_id)
+                candidates.append(
+                    make_evolved_candidate_record(
+                        item,
+                        evolved,
+                        score_rate,
+                        self.model,
+                        candidate_index=candidate_index,
+                        requested_candidates=candidate_count,
+                        operator_id=operator_id,
+                    )
+                )
+            return candidates
+
+    def recommended_candidate_count(self, item: Dict[str, Any]) -> int:
+        if not should_evolve(item, self.min_score_rate):
+            return 1
+
+        count = 1
+        route = get_operator_route(item)
+        state = get_evolution_state(item)
+        action = get_evolution_action(item)
+
+        if route.get("is_high_value_sample") is True:
+            count = max(count, 2)
+        if route.get("should_use_local_tree_search") is True:
+            count = max(count, 2)
+        if action == RECONSTRUCT_LOW_SCORE_BOUNDARY:
+            count = max(count, 2)
+
+        try:
+            full_score_count = int(state.get("consecutive_full_score_count", 0) or 0)
+        except (TypeError, ValueError):
+            full_score_count = 0
+        if full_score_count >= 1:
+            count = max(count, 2)
+        if full_score_count >= 2:
+            count = max(count, 3)
+
+        previous_effect = str(state.get("previous_effect_status", "") or "")
+        try:
+            invalid_count = int(state.get("consecutive_invalid_generation_count", 0) or 0)
+        except (TypeError, ValueError):
+            invalid_count = 0
+        if invalid_count >= 2 or previous_effect in {"invalid_complexity", "no_clear_effect"}:
+            count = max(count, 3)
+
+        return max(1, min(self.num_candidates, count))
+
+    def allocate_candidate_counts(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
+        target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
+        if not target_items:
+            return {}
+
+        budget = self.max_candidate_budget
+        if budget <= 0:
+            budget = len(target_items) * 2
+        if budget < len(target_items):
+            raise ValueError(
+                f"max_candidate_budget={budget} 小于待进化样本数 {len(target_items)}，无法保证每个样本至少 1 个候选"
+            )
+
+        counts = {get_item_key(item): 1 for item in target_items}
+        remaining = budget - len(target_items)
+        ranked_items = sorted(
+            target_items,
+            key=lambda item: self.recommended_candidate_count(item),
+            reverse=True,
+        )
+        for item in ranked_items:
+            key = get_item_key(item)
+            desired = self.recommended_candidate_count(item)
+            while counts[key] < desired and remaining > 0:
+                counts[key] += 1
+                remaining -= 1
+            if remaining <= 0:
+                break
+        return counts
 
     async def process_file(self, input_path: str, output_path: str):
         if not os.path.exists(input_path):
@@ -653,8 +1168,7 @@ class QuestionEvolutionProcessor:
         items = load_json_or_jsonl(input_path)
         target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
         logger.info(
-            f"读取到 {len(items)} 条评分结果，其中得分率 >= {self.min_score_rate:.2%} 的记录 "
-            f"{len(target_items)} 条"
+            f"读取到 {len(items)} 条记录，其中需要 question evolution 的记录 {len(target_items)} 条"
         )
 
         processed_keys = load_processed_keys(output_path)
@@ -669,12 +1183,20 @@ class QuestionEvolutionProcessor:
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
         failed_path = output_path + ".failed"
         file_mode = "a" if processed_keys else "w"
+        candidate_counts = self.allocate_candidate_counts(pending_items) if self.num_candidates > 1 else {}
 
         async def run_one(item: Dict[str, Any], out_f, fail_f):
             try:
-                processed_item = await self.process_item(item)
+                if self.num_candidates > 1:
+                    processed_items = await self.process_item_candidates(
+                        item,
+                        requested_candidates=candidate_counts.get(get_item_key(item), 1),
+                    )
+                else:
+                    processed_items = [await self.process_item(item)]
                 async with self.write_lock:
-                    out_f.write(json.dumps(processed_item, ensure_ascii=False) + "\n")
+                    for processed_item in processed_items:
+                        out_f.write(json.dumps(processed_item, ensure_ascii=False) + "\n")
                     out_f.flush()
             except Exception as e:
                 failed_item = dict(item)
@@ -732,31 +1254,54 @@ async def main():
         default="v1",
         help="question evolution prompt 版本: v1=baseline, v2=反模板化/聚焦"
     )
+    parser.add_argument(
+        "--num-candidates",
+        type=int,
+        default=1,
+        help="每条需进化样本生成的候选题数量；大于 1 时输出候选记录供 validate/select 阶段消费"
+    )
+    parser.add_argument(
+        "--max-candidate-budget",
+        type=int,
+        default=0,
+        help="单轮待进化样本的候选总预算；<=0 时默认为待进化样本数 * 2"
+    )
+    parser.add_argument(
+        "--validation-retries",
+        type=int,
+        default=DEFAULT_MAX_VALIDATION_RETRIES,
+        help="候选题未通过 validate_evolved_question 规则校验时，使用同一 operator 带 reject_reason 重试的次数"
+    )
     args = parser.parse_args()
 
     if args.min_score_rate < 0 or args.min_score_rate > 1:
         raise ValueError("--min-score-rate 必须在 [0, 1] 之间")
+    if args.num_candidates < 1 or args.num_candidates > 4:
+        raise ValueError("--num-candidates 必须在 [1, 4] 之间")
+    if args.validation_retries < 0 or args.validation_retries > 1:
+        raise ValueError("--validation-retries 当前只允许 0 或 1，避免无限修正循环")
 
     if not args.output:
         base, ext = os.path.splitext(args.input)
         args.output = f"{base}_question_evolved{ext or '.jsonl'}"
 
-    api_keys = args.api_key if args.api_key else EVOLVE_API_KEYS
-    if not api_keys:
-        raise ValueError("Set EVOLVE_API_KEYS or OPENAI_API_KEY, or pass --api-key.")
+    api_keys = parse_api_keys(args.api_key)
     client = RotatingAPIClient(
-        base_url=args.base_url,
+        base_url=args.base_url or EVOLVE_BASE_URL,
         api_keys=api_keys,
         request_timeout=args.request_timeout
     )
 
     processor = QuestionEvolutionProcessor(
         client=client,
-        model=args.model,
+        model=args.model or EVOLVE_MODEL,
         max_concurrent=args.concurrency,
         max_retries=args.retries,
         min_score_rate=args.min_score_rate,
-        prompt_version=args.prompt_version
+        prompt_version=args.prompt_version,
+        num_candidates=args.num_candidates,
+        max_validation_retries=args.validation_retries,
+        max_candidate_budget=args.max_candidate_budget,
     )
 
     try:

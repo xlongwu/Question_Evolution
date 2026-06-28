@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Operator Memory Entry",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "sample_id",
+    "round",
+    "sample_signature",
+    "operator_used",
+    "score_rate_before",
+    "score_rate_after",
+    "delta_score_rate",
+    "validation_passed",
+    "hit_confidence",
+    "needs_manual_review",
+    "effect_label"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": ["string", "number"]
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_signature": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "operator_used": {
+      "type": "string"
+    },
+    "expected_qwen_failure": {
+      "type": "string"
+    },
+    "score_rate_before": {
+      "type": "number"
+    },
+    "score_rate_after": {
+      "type": "number"
+    },
+    "delta_score_rate": {
+      "type": "number"
+    },
+    "question_length": {
+      "type": "integer"
+    },
+    "validation_passed": {
+      "type": "boolean"
+    },
+    "hit_confidence": {
+      "enum": ["low", "medium", "high"]
+    },
+    "needs_manual_review": {
+      "type": "boolean"
+    },
+    "effect_label": {
+      "type": "string"
+    },
+    "reuse_note": {
+      "type": "string"
+    }
+  }
+}

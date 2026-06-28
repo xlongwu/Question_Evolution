@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Invalid Generation Case",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["sample_id", "round", "operator_used", "invalid_type", "reason"],
+  "properties": {
+    "sample_id": {
+      "type": ["string", "number"]
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "operator_used": {
+      "type": "string"
+    },
+    "invalid_type": {
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "suggested_operator": {
+      "type": "string"
+    }
+  }
+}

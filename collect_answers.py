@@ -1,4 +1,3 @@
-# collect_answers.py
 import json
 import asyncio
 import logging
@@ -11,23 +10,46 @@ from collections import Counter
 from typing import List, Dict, Any, Tuple
 from openai import AsyncOpenAI
 
-# 尝试导入现有配置
-# try:
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from local_api_config import get_config_list, get_config_value
 
-def _env_list(name: str) -> List[str]:
-    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
-
-
-QA_MODEL = os.getenv("QA_MODEL", "gpt-5.4")
-BASE_URL = os.getenv("QA_BASE_URL", "https://api.openai.com/v1")
-HIAPI_KEYS_BIG = (
-    _env_list("QA_API_KEYS")
-    or _env_list("OPENAI_API_KEYS")
-    or _env_list("OPENAI_API_KEY")
+QA_MODEL = (
+    os.getenv("ANSWER_MODEL")
+    or os.getenv("GPT_MODEL")
+    or get_config_value("ANSWER_MODEL", "QA_MODEL", "GPT_MODEL", default="gpt-5.4")
 )
+BASE_URL = (
+    os.getenv("ANSWER_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or get_config_value("ANSWER_BASE_URL", "BASE_URL", "OPENAI_BASE_URL", default="")
+)
+
+
+def parse_api_keys(cli_keys: List[str] = None) -> List[str]:
+    if cli_keys:
+        keys = [key.strip() for key in cli_keys if key and key.strip()]
+        if keys:
+            return keys
+    raw = (
+        os.getenv("ANSWER_API_KEYS")
+        or os.getenv("GPT_API_KEYS")
+        or os.getenv("OPENAI_API_KEYS")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys
+    return get_config_list(
+        "ANSWER_API_KEYS",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
 
 # 配置日志
 logging.basicConfig(
@@ -500,6 +522,8 @@ async def main():
     parser.add_argument("--samples", type=int, default=1, help="每个问题的采样次数")
     parser.add_argument("--concurrency", type=int, default=20, help="并行处理的问题数量")
     parser.add_argument("--model", type=str, default=QA_MODEL, help="使用的模型名称")
+    parser.add_argument("--base-url", type=str, default=BASE_URL, help="OpenAI-compatible base_url")
+    parser.add_argument("--api-key", action="append", default=None, help="API key；可多次传入，默认读取 ANSWER_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY")
     parser.add_argument("--retries", type=int, default=6, help="LLM 调用失败或返回空答案时的重试次数")
     parser.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT_SECONDS, help="单次请求 timeout 秒数")
     parser.add_argument(
@@ -516,14 +540,14 @@ async def main():
         base, ext = os.path.splitext(args.input)
         args.output = f"{base}_with_answers{ext}"
 
-    api_keys = HIAPI_KEYS_BIG
+    api_keys = parse_api_keys(args.api_key)
     if not api_keys:
-        raise ValueError("Set QA_API_KEYS or OPENAI_API_KEY before collecting answers.")
+        raise ValueError("缺少 ANSWER_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY 或 --api-key")
     
     collector = AnswerCollector(
         api_keys=api_keys,
-        base_url=BASE_URL,
-        model=args.model,
+        base_url=args.base_url or BASE_URL,
+        model=args.model or QA_MODEL,
         max_concurrent=args.concurrency * args.samples, # 总并发控制
         max_retries=args.retries,
         script_gt_guide=args.script_gt_guide,

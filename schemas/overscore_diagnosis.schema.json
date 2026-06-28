@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Overscore Diagnosis",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "is_worth_evolving",
+    "candidate_overscore_cause",
+    "target_failure_mode",
+    "why_high_score_is_suspicious"
+  ],
+  "properties": {
+    "is_worth_evolving": {
+      "type": "boolean"
+    },
+    "candidate_overscore_cause": {
+      "type": "string"
+    },
+    "target_failure_mode": {
+      "type": "string"
+    },
+    "why_high_score_is_suspicious": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Evolution State",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["round", "stop_status"],
+  "properties": {
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "previous_operator": {
+      "type": ["string", "null"]
+    },
+    "previous_score_rate": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "previous_effect_status": {
+      "type": ["string", "null"]
+    },
+    "previous_failure_mode": {
+      "type": ["string", "null"]
+    },
+    "consecutive_full_score_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "consecutive_same_operator_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "avoid_methods": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recommended_next_methods": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "stop_status": {
+      "enum": [
+        "continue",
+        "effective_boundary_sample",
+        "invalid_complexity_sample",
+        "unanswerable_or_trap_sample",
+        "stable_high_score_stop",
+        "continue_with_new_operator",
+        "local_tree_search_needed"
+      ]
+    }
+  }
+}

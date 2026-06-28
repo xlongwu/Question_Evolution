@@ -1,4 +1,3 @@
-# gen_rubric.py
 import os
 import json
 import asyncio
@@ -15,19 +14,43 @@ from tqdm.asyncio import tqdm_asyncio
 import sys
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
+from local_api_config import get_config_list, get_config_value
 
-def _env_list(name: str) -> List[str]:
-    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
-
-
-QA_MODEL = os.getenv("RUBRIC_MODEL", os.getenv("QA_MODEL", "gpt-5.4"))
-BASE_URL = os.getenv("RUBRIC_BASE_URL", os.getenv("QA_BASE_URL", "https://api.openai.com/v1"))
-HIAPI_KEYS_BIG = (
-    _env_list("RUBRIC_API_KEYS")
-    or _env_list("QA_API_KEYS")
-    or _env_list("OPENAI_API_KEYS")
-    or _env_list("OPENAI_API_KEY")
+QA_MODEL = (
+    os.getenv("RUBRIC_MODEL")
+    or os.getenv("GPT_MODEL")
+    or get_config_value("RUBRIC_MODEL", "QA_MODEL", "GPT_MODEL", default="gpt-5.4")
 )
+BASE_URL = (
+    os.getenv("RUBRIC_BASE_URL")
+    or os.getenv("OPENAI_BASE_URL")
+    or get_config_value("RUBRIC_BASE_URL", "BASE_URL", "OPENAI_BASE_URL", default="")
+)
+
+
+def parse_api_keys(cli_keys: List[str] = None) -> List[str]:
+    if cli_keys:
+        keys = [key.strip() for key in cli_keys if key and key.strip()]
+        if keys:
+            return keys
+    raw = (
+        os.getenv("RUBRIC_API_KEYS")
+        or os.getenv("GPT_API_KEYS")
+        or os.getenv("OPENAI_API_KEYS")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys
+    return get_config_list(
+        "RUBRIC_API_KEYS",
+        "GPT_API_KEYS",
+        "HIAPI_KEYS_BIG",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
 
 
 class RotatingAPIClient:
@@ -808,15 +831,24 @@ async def failed_writer_worker(failed_queue, failed_file, file_mode='a'):
             finally:
                 failed_queue.task_done()
 
-async def main(input_file, output_file, concurrency=5, model="gemini-3-flash-preview", request_timeout=None, prompt_version="v3"):
+async def main(
+    input_file,
+    output_file,
+    concurrency=5,
+    model=QA_MODEL,
+    request_timeout=None,
+    prompt_version="v3",
+    base_url=BASE_URL,
+    api_keys=None,
+):
     """
     主处理函数
     """
-    api_keys = HIAPI_KEYS_BIG
+    api_keys = list(api_keys) if api_keys is not None else parse_api_keys()
     if not api_keys:
-        raise ValueError("Set RUBRIC_API_KEYS, QA_API_KEYS, or OPENAI_API_KEY before generating rubrics.")
+        raise ValueError("缺少 RUBRIC_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY 或 --api-key")
     client = RotatingAPIClient(
-        base_url=BASE_URL,
+        base_url=base_url,
         api_keys=api_keys
     )
     client.request_timeout = request_timeout
@@ -915,7 +947,9 @@ if __name__ == "__main__":
     parser.add_argument('--input', default="output/police_Q_公安教材-1/policeQA_formatted_公安教材第一批_0126.jsonl", help='输入JSONL文件路径')
     parser.add_argument('--output', default="output/police_Q_公安教材-1/policeQA_Rubric_公安教材第一批_0126.jsonl", help='输出JSONL文件路径')
     parser.add_argument('--concurrency', type=int, default=20, help='并发数量 (默认: 5)')
-    parser.add_argument('--model', default="gemini-3-flash-preview", help='使用的LLM模型 (默认: gpt-4o)')
+    parser.add_argument('--model', default=QA_MODEL, help='使用的LLM模型')
+    parser.add_argument('--base-url', default=BASE_URL, help='OpenAI-compatible base_url')
+    parser.add_argument('--api-key', action='append', default=None, help='API key；可多次传入，默认读取 RUBRIC_API_KEYS/GPT_API_KEYS/OPENAI_API_KEY')
     parser.add_argument('--request-timeout', type=float, default=60.0, help='OpenAI SDK 单次请求 timeout 秒数')
     parser.add_argument('--prompt-version', default='v4', help='rubric prompt 版本: v3=baseline, v4=实验版')
     
@@ -935,9 +969,11 @@ if __name__ == "__main__":
             input_file=args.input,
             output_file=args.output,
             concurrency=args.concurrency,
-            model=args.model,
+            model=args.model or QA_MODEL,
             request_timeout=args.request_timeout,
-            prompt_version=args.prompt_version
+            prompt_version=args.prompt_version,
+            base_url=args.base_url or BASE_URL,
+            api_keys=parse_api_keys(args.api_key),
         ))
     except Exception as e:
         logger.critical(f"程序异常终止: {str(e)}", exc_info=True)

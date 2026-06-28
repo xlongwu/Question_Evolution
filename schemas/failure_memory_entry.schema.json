@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Failure Memory Entry",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "sample_id",
+    "round",
+    "sample_signature",
+    "operator_used",
+    "score_rate_before",
+    "score_rate_after",
+    "failure_type",
+    "failure_reason"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": ["string", "number"]
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_signature": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "operator_used": {
+      "type": "string"
+    },
+    "score_rate_before": {
+      "type": "number"
+    },
+    "score_rate_after": {
+      "type": "number"
+    },
+    "failure_type": {
+      "type": "string"
+    },
+    "failure_reason": {
+      "type": "string"
+    },
+    "avoid_note": {
+      "type": "string"
+    }
+  }
+}

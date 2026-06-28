@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Effect Analysis",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "score_rate_before",
+    "score_rate_after",
+    "delta_score_rate",
+    "operator_used",
+    "lightweight_boundary_hit"
+  ],
+  "properties": {
+    "score_rate_before": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "score_rate_after": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "delta_score_rate": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1
+    },
+    "operator_used": {
+      "type": "string"
+    },
+    "question_length": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "is_full_score": {
+      "type": "boolean"
+    },
+    "complexity_passed": {
+      "type": "boolean"
+    },
+    "repeated_pattern_with_previous_round": {
+      "type": "boolean"
+    },
+    "lightweight_boundary_hit": {
+      "type": "boolean"
+    },
+    "hit_confidence": {
+      "enum": ["low", "medium", "high"]
+    },
+    "needs_manual_review": {
+      "type": "boolean"
+    },
+    "lightweight_hit_reason": {
+      "type": "string"
+    },
+    "effect_label": {
+      "type": "string"
+    }
+  }
+}

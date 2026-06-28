@@ -1,4 +1,3 @@
-# scoring.py
 import argparse
 import asyncio
 import json
@@ -9,18 +8,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
+from local_api_config import get_config_list, get_config_value
 
-def _env_list(name: str) -> List[str]:
-    return [value.strip() for value in os.getenv(name, "").split(",") if value.strip()]
-
-
-JUDGE_MODEL = os.getenv("JUDGE_MODEL", "hjl_Qwen3.6-27B")  # 作为judge完全够用
-JUDGE_BASE_URL = os.getenv("JUDGE_BASE_URL", "http://127.0.0.1:18011/v1")
-JUDGE_API_KEYS = (
-    _env_list("JUDGE_API_KEYS")
-    or _env_list("OPENAI_API_KEYS")
-    or _env_list("OPENAI_API_KEY")
-    or ["key"]
+JUDGE_MODEL = (
+    os.getenv("JUDGE_MODEL")
+    or os.getenv("QWEN_MODEL")
+    or get_config_value("JUDGE_MODEL", "QWEN_MODEL", default="hjl_Qwen3.6-27B")
+)
+JUDGE_BASE_URL = (
+    os.getenv("JUDGE_BASE_URL")
+    or os.getenv("QWEN_BASE_URL")
+    or get_config_value("JUDGE_BASE_URL", "QWEN_BASE_URL", default="http://127.0.0.1:18011/v1")
+)
+ANSWER_MODEL = (
+    os.getenv("ANSWER_MODEL")
+    or os.getenv("QWEN_MODEL")
+    or get_config_value("ANSWER_MODEL", "QWEN_MODEL", default="")
+)
+ANSWER_BASE_URL = (
+    os.getenv("ANSWER_BASE_URL")
+    or os.getenv("QWEN_BASE_URL")
+    or get_config_value("ANSWER_BASE_URL", "QWEN_BASE_URL", default="")
 )
 
 
@@ -33,6 +41,58 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+def parse_api_keys(cli_keys: Optional[List[str]] = None) -> List[str]:
+    if cli_keys:
+        keys = [key.strip() for key in cli_keys if key and key.strip()]
+        if keys:
+            return keys
+    raw = (
+        os.getenv("JUDGE_API_KEYS")
+        or os.getenv("QWEN_API_KEYS")
+        or os.getenv("QWEN_API_KEY")
+        or os.getenv("OPENAI_API_KEYS")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys
+    keys = get_config_list(
+        "JUDGE_API_KEYS",
+        "QWEN_API_KEYS",
+        "QWEN_API_KEY",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
+    return keys or ["EMPTY_KEY"]
+
+
+def resolve_answer_api_key(cli_key: str = "") -> str:
+    text = (cli_key or "").strip()
+    if text:
+        return text
+    raw = (
+        os.getenv("ANSWER_API_KEY")
+        or os.getenv("QWEN_API_KEY")
+        or os.getenv("OPENAI_API_KEY")
+        or ""
+    )
+    keys = [part.strip() for part in raw.split(",") if part.strip()]
+    if keys:
+        return keys[0]
+    config_keys = get_config_list(
+        "ANSWER_API_KEYS",
+        "ANSWER_API_KEY",
+        "QWEN_API_KEYS",
+        "QWEN_API_KEY",
+        "OPENAI_API_KEYS",
+        "OPENAI_API_KEY",
+        "API_KEYS",
+    )
+    return config_keys[0] if config_keys else ""
 
 
 def extract_answer(resp) -> str:
@@ -278,6 +338,41 @@ def build_scoring_prompt(score_prompt: str, answer_text: str) -> str:
     return score_prompt.replace(ANSWER_PLACEHOLDER, answer_text)
 
 
+def compute_score_rate(scoring_result: Dict[str, Any]) -> Optional[float]:
+    try:
+        awarded = float(scoring_result.get("total_awarded", 0) or 0)
+        possible = float(scoring_result.get("total_possible", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if possible <= 0:
+        return None
+    score_rate = awarded / possible
+    if score_rate < 0:
+        return 0.0
+    if score_rate > 1:
+        return 1.0
+    return score_rate
+
+
+def ensure_sample_identity(item: Dict[str, Any]) -> None:
+    if item.get("sample_id") is not None:
+        return
+    for field in ("index", "id"):
+        value = item.get(field)
+        if value is not None and str(value).strip():
+            item["sample_id"] = str(value).strip()
+            return
+
+
+def attach_score_rate(item: Dict[str, Any]) -> None:
+    scoring_result = item.get("scoring_result")
+    if not isinstance(scoring_result, dict):
+        return
+    score_rate = compute_score_rate(scoring_result)
+    if score_rate is not None:
+        item["score_rate"] = score_rate
+
+
 class ScoringProcessor:
     def __init__(
         self,
@@ -392,6 +487,8 @@ class ScoringProcessor:
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
+            ensure_sample_identity(item)
+
             # question evolution 循环中，未进化样本应完全复用上一轮评分结果，
             # 避免重复答题/重评带来的随机波动污染本轮进化效果。
             if item.get("question_evolved") is False:
@@ -399,6 +496,7 @@ class ScoringProcessor:
                 if not isinstance(scoring_result, dict) or not scoring_result:
                     raise ValueError("question_evolved=False 但缺少可复用的 scoring_result")
                 logger.info(f"透传未进化样本 index={item.get('index')}，不重新答题/评分")
+                attach_score_rate(item)
                 return item
 
             score_prompt_template = item.get("score_prompt")
@@ -438,6 +536,7 @@ class ScoringProcessor:
                 "judge_model": self.judge_model,
                 "judge_raw_response": score_result.get("_raw_response", "")
             }
+            attach_score_rate(item)
             return item
 
     def _print_scoring_stats(self, results: List[Dict[str, Any]]):
@@ -566,6 +665,8 @@ async def main():
     parser.add_argument("--concurrency", type=int, default=50, help="并行处理的题目数量")
     parser.add_argument("--retries", type=int, default=3, help="评分调用失败时的重试次数")
     parser.add_argument("--judge-model", type=str, default=JUDGE_MODEL, help="评分模型名称")
+    parser.add_argument("--judge-base-url", type=str, default=JUDGE_BASE_URL, help="评分模型 OpenAI-compatible base_url")
+    parser.add_argument("--judge-api-key", action="append", default=None, help="评分模型 API key；可多次传入。本地 Qwen 服务不需要 key 时可不传。")
     parser.add_argument(
         "--answer-mode",
         type=str,
@@ -573,9 +674,9 @@ async def main():
         default="reference",
         help="待评答案来源：reference=直接使用 meta_info.references[0]；llm=读取已有 candidate_answer 或调用自由配置模型生成答案"
     )
-    parser.add_argument("--answer-base-url", type=str, default="", help="待评答案模型的 base_url")
-    parser.add_argument("--answer-api-key", type=str, default="", help="待评答案模型的 api_key，可为空字符串")
-    parser.add_argument("--answer-model", type=str, default="", help="待评答案模型名称")
+    parser.add_argument("--answer-base-url", type=str, default=ANSWER_BASE_URL, help="待评答案模型的 base_url")
+    parser.add_argument("--answer-api-key", type=str, default="", help="待评答案模型的 api_key；本地 Qwen 服务不需要 key 时可为空字符串")
+    parser.add_argument("--answer-model", type=str, default=ANSWER_MODEL, help="待评答案模型名称")
     args = parser.parse_args()
 
     if not args.output:
@@ -585,25 +686,27 @@ async def main():
     answer_client = None
     answer_model_name = ""
     if args.answer_mode == "llm":
-        if not args.answer_base_url.strip():
+        resolved_answer_base_url = (args.answer_base_url or ANSWER_BASE_URL).strip()
+        resolved_answer_model = (args.answer_model or ANSWER_MODEL).strip()
+        if not resolved_answer_base_url:
             raise ValueError("自由 LLM 模式下必须提供 --answer-base-url")
-        if not args.answer_model.strip():
+        if not resolved_answer_model:
             raise ValueError("自由 LLM 模式下必须提供 --answer-model")
         answer_client = AnswerLLMClient(
-            base_url=args.answer_base_url.strip(),
-            api_key=args.answer_api_key,
-            model=args.answer_model.strip()
+            base_url=resolved_answer_base_url,
+            api_key=resolve_answer_api_key(args.answer_api_key),
+            model=resolved_answer_model
         )
-        answer_model_name = args.answer_model.strip()
+        answer_model_name = resolved_answer_model
 
     judge_client = RotatingAPIClient(
-        base_url=JUDGE_BASE_URL,
-        api_keys=JUDGE_API_KEYS
+        base_url=args.judge_base_url or JUDGE_BASE_URL,
+        api_keys=parse_api_keys(args.judge_api_key)
     )
 
     processor = ScoringProcessor(
         judge_client=judge_client,
-        judge_model=args.judge_model,
+        judge_model=args.judge_model or JUDGE_MODEL,
         answer_mode=args.answer_mode,
         max_concurrent=args.concurrency,
         max_retries=args.retries,

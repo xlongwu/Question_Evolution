@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Sample Profile",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "core_capability",
+    "claim_level",
+    "problem_shape",
+    "reasoning_granularity",
+    "answer_mode_expected",
+    "easy_judgment_risk",
+    "external_knowledge_risk",
+    "complexity_expansion_risk"
+  ],
+  "properties": {
+    "core_capability": {
+      "type": "string"
+    },
+    "claim_level": {
+      "type": "string"
+    },
+    "problem_shape": {
+      "type": "string"
+    },
+    "reasoning_granularity": {
+      "type": "string"
+    },
+    "answer_mode_expected": {
+      "type": "string"
+    },
+    "easy_judgment_risk": {
+      "enum": ["low", "medium", "high"]
+    },
+    "external_knowledge_risk": {
+      "enum": ["low", "medium", "high"]
+    },
+    "complexity_expansion_risk": {
+      "enum": ["low", "medium", "high"]
+    }
+  }
+}

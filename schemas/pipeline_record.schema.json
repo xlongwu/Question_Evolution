@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Pipeline Record",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["prompt"],
+  "properties": {
+    "sample_id": {
+      "type": ["string", "number"],
+      "description": "Stable sample identifier when available."
+    },
+    "index": {
+      "type": ["string", "number", "integer"],
+      "description": "Legacy row identifier used by current scripts."
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "meta_info": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "rubric": {
+      "type": "array"
+    },
+    "score_prompt": {
+      "type": "string"
+    },
+    "scoring_result": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "score_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "sample_profile": {
+      "$ref": "sample_profile.schema.json"
+    },
+    "overscore_diagnosis": {
+      "$ref": "overscore_diagnosis.schema.json"
+    },
+    "question_evolved": {
+      "type": "boolean"
+    },
+    "evolution_state": {
+      "$ref": "evolution_state.schema.json"
+    },
+    "evolution_action": {
+      "enum": [
+        "evolve_high_score_overscore",
+        "reconstruct_low_score_boundary",
+        "pass_through_or_scoring_noise",
+        "stop_evolution"
+      ]
+    },
+    "operator_route": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "primary_operator": {
+          "type": ["string", "null"]
+        },
+        "backup_operators": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "avoid_operators": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "routing_reason": {
+          "type": "string"
+        },
+        "is_high_value_sample": {
+          "type": "boolean"
+        },
+        "should_use_local_tree_search": {
+          "type": "boolean"
+        }
+      }
+    },
+    "candidate_group_id": {
+      "type": "string"
+    },
+    "candidate_id": {
+      "type": "string"
+    },
+    "candidate_operator": {
+      "type": ["string", "null"]
+    },
+    "candidate_generation": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "validation_result": {
+      "$ref": "validation_result.schema.json"
+    },
+    "candidate_selection": {
+      "$ref": "candidate_selection.schema.json"
+    },
+    "effect_analysis": {
+      "$ref": "effect_analysis.schema.json"
+    }
+  }
+}

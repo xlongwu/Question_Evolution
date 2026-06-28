@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Question Evolution Result",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["evolved_prompt"],
+  "properties": {
+    "evolved_prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evolution_strategy": {
+      "type": "string"
+    },
+    "ability_axis": {
+      "type": "string"
+    },
+    "target_subclaim": {
+      "type": "string"
+    },
+    "boundary_hypothesis": {
+      "type": "string"
+    },
+    "expected_qwen_failure": {
+      "type": "string"
+    },
+    "expected_evaluation_focus": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "notes_for_reference": {
+      "type": "string"
+    },
+    "question_evolution_raw_response": {
+      "type": "string"
+    }
+  }
+}

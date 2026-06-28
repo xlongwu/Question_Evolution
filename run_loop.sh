@@ -1,34 +1,58 @@
-# run_loop.sh
 #!/bin/bash
 # Question Evolution 循环流水线
-# 每轮把上一轮 scored 结果中的高分题进行 question evolution，并重新采集 reference、生成 rubric、复测。
-# 支持提前停止：当某轮 Qwen 平均得分率 < EARLY_STOP_RATE 时停止。
-# 每轮数据单独保存在 当天日期/exp*/round_N/ 子文件夹中。
+# 每轮把上一轮 scored/state 结果接入画像、分流、路由、多候选进化、复杂度校验、
+# 标准采答案/rubric/评分闭环、效果统计和状态更新。
+# 支持断点续跑：每一步的目标文件已存在且非空时跳过该步，避免重复写 memory。
 
-set -uo pipefail
+set -euo pipefail
 
 # ===================== 可配置参数 =====================
-MAX_ROUNDS=5                      # 最大迭代轮数
-EARLY_STOP_RATE=0.5                # 提前停止阈值：平均得分率低于该值则停止
-MIN_SCORE_RATE=0.8                 # question_evolution 触发阈值
+MAX_ROUNDS=${MAX_ROUNDS:-5}                      # 最大迭代轮数
+EARLY_STOP_RATE=${EARLY_STOP_RATE:-0.5}          # 平均得分率低于该值时停止
+MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触发阈值
+NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
+MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
+VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
 
-INPUT_FILE="data/police_qa_testset_v2.8_iteration_subset_selected.jsonl"   # 初始输入（含 prompt + references + rubric）
-EXP_ROOT="experiments"                            # 实验结果根目录；每天在其下创建 YYYY-MM-DD/exp*
+DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"
+LEGACY_INPUT_FILE="data/data.jsonl"
+INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}    # 推荐输入：已完成准入的种子样本
+EXP_ROOT=${EXP_ROOT:-"experiments"}              # 实验结果根目录
 
 # Qwen（候选模型 / 评分模型）配置
-QWEN_BASE_URL="http://127.0.0.1:18011/v1"
-QWEN_API_KEY=""
-QWEN_MODEL="hjl_Qwen3.6-27B"
+QWEN_BASE_URL=${QWEN_BASE_URL:-"http://127.0.0.1:18011/v1"}
+QWEN_API_KEY=${QWEN_API_KEY:-""}
+QWEN_MODEL=${QWEN_MODEL:-"hjl_Qwen3.6-27B"}
 
-# GPT（参考答案 / rubric 生成模型）配置
-GPT_MODEL="gpt-5.4"
+# GPT / OpenAI-compatible 配置。API key 优先使用各脚本支持的环境变量：
+# PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
+GPT_MODEL=${GPT_MODEL:-"gpt-5.4"}
+OPENAI_BASE_URL=${OPENAI_BASE_URL:-""}
+PROFILE_MODEL=${PROFILE_MODEL:-$GPT_MODEL}
+PROFILE_BASE_URL=${PROFILE_BASE_URL:-$OPENAI_BASE_URL}
+EVOLVE_MODEL=${EVOLVE_MODEL:-$GPT_MODEL}
+EVOLVE_BASE_URL=${EVOLVE_BASE_URL:-$OPENAI_BASE_URL}
+ANSWER_BASE_URL=${ANSWER_BASE_URL:-$OPENAI_BASE_URL}
+RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
 
 # 并发数
-SCORING_CONCURRENCY=10
-EVO_CONCURRENCY=10
-ANSWER_CONCURRENCY=10
-RUBRIC_CONCURRENCY=10
+SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-10}
+PROFILE_CONCURRENCY=${PROFILE_CONCURRENCY:-5}
+EVO_CONCURRENCY=${EVO_CONCURRENCY:-10}
+ANSWER_CONCURRENCY=${ANSWER_CONCURRENCY:-10}
+RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
 # ======================================================
+
+if [ ! -f "$INPUT_FILE" ] && [ "$INPUT_FILE" = "$DEFAULT_INPUT_FILE" ] && [ -f "$LEGACY_INPUT_FILE" ]; then
+    echo "未找到 $DEFAULT_INPUT_FILE，回退到旧输入文件: $LEGACY_INPUT_FILE"
+    INPUT_FILE="$LEGACY_INPUT_FILE"
+fi
+
+if [ ! -f "$INPUT_FILE" ]; then
+    echo "输入文件不存在: $INPUT_FILE"
+    echo "请设置 INPUT_FILE 指向 admitted_seed_samples.jsonl 或其他已准入 JSONL。"
+    exit 1
+fi
 
 # 为当天运行自动选择实验目录：
 #   experiments/YYYY-MM-DD/exp
@@ -49,7 +73,29 @@ if [ -e "$EXP_DIR" ]; then
 fi
 mkdir -p "$EXP_DIR"
 
+MEMORY_DIR="$EXP_DIR/memory"
+mkdir -p "$MEMORY_DIR"
+for bank_file in operator_memory_bank.jsonl failure_memory_bank.jsonl invalid_generation_cases.jsonl; do
+    if [ ! -f "$MEMORY_DIR/$bank_file" ]; then
+        : > "$MEMORY_DIR/$bank_file"
+    fi
+done
+
 echo "本次实验目录: $EXP_DIR"
+echo "Memory 目录: $MEMORY_DIR"
+
+run_if_missing() {
+    local output_file="$1"
+    local step_label="$2"
+    shift 2
+
+    if [ -f "$output_file" ] && [ -s "$output_file" ]; then
+        echo "检测到已存在 $output_file，跳过 $step_label"
+    else
+        echo "$step_label"
+        "$@"
+    fi
+}
 
 # 辅助函数：计算 jsonl 的平均得分率
 compute_avg_score_rate() {
@@ -82,9 +128,14 @@ lt_float() {
 SUMMARY_FILE="$EXP_DIR/summary.txt"
 echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
 echo "================================" >> "$SUMMARY_FILE"
+echo "Input file: $INPUT_FILE" >> "$SUMMARY_FILE"
+echo "Memory dir: $MEMORY_DIR" >> "$SUMMARY_FILE"
 echo "Max rounds: $MAX_ROUNDS" >> "$SUMMARY_FILE"
 echo "Early stop rate: $EARLY_STOP_RATE" >> "$SUMMARY_FILE"
 echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
+echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
+echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
+echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
 echo "------|----------------|--------" >> "$SUMMARY_FILE"
@@ -96,13 +147,13 @@ mkdir -p "$ROUND_DIR"
 
 echo ""
 echo "========================================"
-echo "Round $ROUND: 初始评分（ baseline ）"
+echo "Round $ROUND: 初始评分（baseline）"
 echo "========================================"
 
-if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
-    echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮执行"
-else
+run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/2: 准备 baseline input" \
     cp "$INPUT_FILE" "$ROUND_DIR/input.jsonl"
+
+run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: scoring.py baseline" \
     python scoring.py \
         --input "$ROUND_DIR/input.jsonl" \
         --output "$ROUND_DIR/scored.jsonl" \
@@ -110,8 +161,10 @@ else
         --answer-base-url "$QWEN_BASE_URL" \
         --answer-api-key "$QWEN_API_KEY" \
         --answer-model "$QWEN_MODEL" \
+        --judge-base-url "$QWEN_BASE_URL" \
+        --judge-api-key "$QWEN_API_KEY" \
+        --judge-model "$QWEN_MODEL" \
         --concurrency "$SCORING_CONCURRENCY"
-fi
 
 AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
 echo "Round $ROUND 平均得分率: $AVG_RATE"
@@ -129,66 +182,120 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     echo "Round $ROUND: Question Evolution"
     echo "========================================"
 
-    # 断点续跑：如果本轮 scored.jsonl 已存在且非空，则跳过执行，只做评估
-    if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
-        echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮执行"
-    else
-        # 1) 复制上一轮 scored 结果作为本轮输入
+    run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/11: 复制上一轮 scored/state 输入" \
         cp "$PREV_SCORED" "$ROUND_DIR/input.jsonl"
 
-        # 2) Question Evolution：对高分题升级
-        echo "[Round $ROUND] Step 1/4: question_evolution.py"
-        python question_evolution.py \
-            --input "$ROUND_DIR/input.jsonl" \
-            --output "$ROUND_DIR/evolved.jsonl" \
-            --min-score-rate "$MIN_SCORE_RATE" \
-            --concurrency "$EVO_CONCURRENCY"
+    if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
+        echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
+    else
+        run_if_missing "$ROUND_DIR/profiled.jsonl" "[Round $ROUND] Step 1/11: profile_samples.py" \
+            python profile_samples.py \
+                --input "$ROUND_DIR/input.jsonl" \
+                --output "$ROUND_DIR/profiled.jsonl" \
+                --model "$PROFILE_MODEL" \
+                --base-url "$PROFILE_BASE_URL" \
+                --concurrency "$PROFILE_CONCURRENCY"
 
-        # 3) 为进化后的题目重新采集参考答案
-        echo "[Round $ROUND] Step 2/4: collect_answers.py"
-        python collect_answers.py \
-            --input "$ROUND_DIR/evolved.jsonl" \
-            --output "$ROUND_DIR/with_answers.jsonl" \
-            --concurrency "$ANSWER_CONCURRENCY" \
-            --samples 1 \
-            --model "$GPT_MODEL"
+        run_if_missing "$ROUND_DIR/profiled_candidates.jsonl" "[Round $ROUND] Step 2/11: select_evolution_candidates.py" \
+            python select_evolution_candidates.py \
+                --input "$ROUND_DIR/profiled.jsonl" \
+                --output "$ROUND_DIR/profiled_candidates.jsonl" \
+                --high-score-threshold "$MIN_SCORE_RATE"
 
-        # 4) 针对新题和新 reference 生成 rubric
-        echo "[Round $ROUND] Step 3/4: gen_rubric.py"
-        python gen_rubric.py \
-            --input "$ROUND_DIR/with_answers.jsonl" \
-            --output "$ROUND_DIR/rubric.jsonl" \
-            --concurrency "$RUBRIC_CONCURRENCY" \
-            --model "$GPT_MODEL"
+        run_if_missing "$ROUND_DIR/routed.jsonl" "[Round $ROUND] Step 3/11: operator_router.py" \
+            python operator_router.py \
+                --input "$ROUND_DIR/profiled_candidates.jsonl" \
+                --output "$ROUND_DIR/routed.jsonl" \
+                --memory-dir "$MEMORY_DIR"
 
-        # 5) 用 Qwen 重新答题并评分
-        echo "[Round $ROUND] Step 4/4: scoring.py"
-        python scoring.py \
-            --input "$ROUND_DIR/rubric.jsonl" \
-            --output "$ROUND_DIR/scored.jsonl" \
-            --answer-mode llm \
-            --answer-base-url "$QWEN_BASE_URL" \
-            --answer-api-key "$QWEN_API_KEY" \
-            --answer-model "$QWEN_MODEL" \
-            --concurrency "$SCORING_CONCURRENCY"
+        run_if_missing "$ROUND_DIR/candidates.jsonl" "[Round $ROUND] Step 4/11: question_evolution.py" \
+            python question_evolution.py \
+                --input "$ROUND_DIR/routed.jsonl" \
+                --output "$ROUND_DIR/candidates.jsonl" \
+                --min-score-rate "$MIN_SCORE_RATE" \
+                --model "$EVOLVE_MODEL" \
+                --base-url "$EVOLVE_BASE_URL" \
+                --concurrency "$EVO_CONCURRENCY" \
+                --num-candidates "$NUM_CANDIDATES" \
+                --max-candidate-budget "$MAX_CANDIDATE_BUDGET" \
+                --validation-retries "$VALIDATION_RETRIES"
+
+        run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 5/11: validate_evolved_question.py" \
+            python validate_evolved_question.py \
+                --input "$ROUND_DIR/candidates.jsonl" \
+                --output "$ROUND_DIR/validated_candidates.jsonl"
+
+        run_if_missing "$ROUND_DIR/evolved.jsonl" "[Round $ROUND] Step 6/11: candidate_selection.py" \
+            python candidate_selection.py \
+                --input "$ROUND_DIR/validated_candidates.jsonl" \
+                --output "$ROUND_DIR/evolved.jsonl" \
+                --invalid-output "$ROUND_DIR/invalid_generation_cases.jsonl"
+
+        run_if_missing "$ROUND_DIR/with_answers.jsonl" "[Round $ROUND] Step 7/11: collect_answers.py" \
+            python collect_answers.py \
+                --input "$ROUND_DIR/evolved.jsonl" \
+                --output "$ROUND_DIR/with_answers.jsonl" \
+                --concurrency "$ANSWER_CONCURRENCY" \
+                --samples 1 \
+                --model "$GPT_MODEL" \
+                --base-url "$ANSWER_BASE_URL"
+
+        run_if_missing "$ROUND_DIR/rubric.jsonl" "[Round $ROUND] Step 8/11: gen_rubric.py" \
+            python gen_rubric.py \
+                --input "$ROUND_DIR/with_answers.jsonl" \
+                --output "$ROUND_DIR/rubric.jsonl" \
+                --concurrency "$RUBRIC_CONCURRENCY" \
+                --model "$GPT_MODEL" \
+                --base-url "$RUBRIC_BASE_URL"
+
+        run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 9/11: scoring.py" \
+            python scoring.py \
+                --input "$ROUND_DIR/rubric.jsonl" \
+                --output "$ROUND_DIR/scored.jsonl" \
+                --answer-mode llm \
+                --answer-base-url "$QWEN_BASE_URL" \
+                --answer-api-key "$QWEN_API_KEY" \
+                --answer-model "$QWEN_MODEL" \
+                --judge-base-url "$QWEN_BASE_URL" \
+                --judge-api-key "$QWEN_API_KEY" \
+                --judge-model "$QWEN_MODEL" \
+                --concurrency "$SCORING_CONCURRENCY"
     fi
+
+    run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 10/11: analyze_evolution_effect.py" \
+        python analyze_evolution_effect.py \
+            --before "$PREV_SCORED" \
+            --input "$ROUND_DIR/scored.jsonl" \
+            --output "$ROUND_DIR/effect_analysis.jsonl" \
+            --matrix-output "$ROUND_DIR/effect_matrix.jsonl"
+
+    run_if_missing "$ROUND_DIR/state_updated.jsonl" "[Round $ROUND] Step 11/11: update_sample_state.py" \
+        python update_sample_state.py \
+            --input "$ROUND_DIR/effect_analysis.jsonl" \
+            --output "$ROUND_DIR/state_updated.jsonl" \
+            --memory-dir "$MEMORY_DIR"
 
     # 计算本轮平均得分率
     AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
     echo "Round $ROUND 平均得分率: $AVG_RATE"
+
+    ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/scored.jsonl"
+    if [ -f "$ROUND_DIR/state_updated.jsonl" ] && [ -s "$ROUND_DIR/state_updated.jsonl" ]; then
+        ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/state_updated.jsonl"
+    fi
 
     # 检查提前停止条件
     SHOULD_STOP=$(lt_float "$AVG_RATE" "$EARLY_STOP_RATE")
     if [ "$SHOULD_STOP" = "true" ]; then
         echo "提前停止：Round $ROUND 平均得分率 $AVG_RATE < $EARLY_STOP_RATE"
         printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "early_stop" >> "$SUMMARY_FILE"
-        PREV_SCORED="$ROUND_DIR/scored.jsonl"
+        PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
         break
     else
         printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "continue" >> "$SUMMARY_FILE"
     fi
 
-    PREV_SCORED="$ROUND_DIR/scored.jsonl"
+    PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
 done
 
 # ===================== 保存最终结果 =====================
