@@ -9,12 +9,14 @@ set -euo pipefail
 # ===================== 可配置参数 =====================
 MAX_ROUNDS=${MAX_ROUNDS:-5}                      # 最大迭代轮数
 EARLY_STOP_RATE=${EARLY_STOP_RATE:-0.5}          # 平均得分率低于该值时停止
+NO_INFO_STOP_ROUNDS=${NO_INFO_STOP_ROUNDS:-2}    # 连续多少轮无新信息时停止
+NO_INFO_MIN_DELTA=${NO_INFO_MIN_DELTA:-0.0001}   # 平均分变化小于该值视为无新信息
 MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触发阈值
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
 
-DEFAULT_INPUT_FILE="admitted_seed_samples.jsonl"
+DEFAULT_INPUT_FILE="data/data.jsonl"
 LEGACY_INPUT_FILE="data/data.jsonl"
 INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}    # 推荐输入：已完成准入的种子样本
 EXP_ROOT=${EXP_ROOT:-"experiments"}              # 实验结果根目录
@@ -125,6 +127,29 @@ lt_float() {
     python -c "print('true' if float('$1') < float('$2') else 'false')"
 }
 
+abs_diff_float() {
+    python -c "print(abs(float('$1') - float('$2')))"
+}
+
+extract_effect_count() {
+    local analyzed_file="$1"
+    python - "$analyzed_file" <<'PY'
+import json, sys
+path = sys.argv[1]
+count = 0
+with open(path, "r", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        item = json.loads(line)
+        effect = item.get("effect_analysis", {})
+        if isinstance(effect, dict) and effect.get("effect_label") == "effective_boundary_probe":
+            count += 1
+print(count)
+PY
+}
+
 SUMMARY_FILE="$EXP_DIR/summary.txt"
 echo "Question Evolution Loop Summary" > "$SUMMARY_FILE"
 echo "================================" >> "$SUMMARY_FILE"
@@ -132,6 +157,8 @@ echo "Input file: $INPUT_FILE" >> "$SUMMARY_FILE"
 echo "Memory dir: $MEMORY_DIR" >> "$SUMMARY_FILE"
 echo "Max rounds: $MAX_ROUNDS" >> "$SUMMARY_FILE"
 echo "Early stop rate: $EARLY_STOP_RATE" >> "$SUMMARY_FILE"
+echo "No-info stop rounds: $NO_INFO_STOP_ROUNDS" >> "$SUMMARY_FILE"
+echo "No-info min delta: $NO_INFO_MIN_DELTA" >> "$SUMMARY_FILE"
 echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
 echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
 echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
@@ -171,6 +198,9 @@ echo "Round $ROUND 平均得分率: $AVG_RATE"
 printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "baseline" >> "$SUMMARY_FILE"
 
 PREV_SCORED="$ROUND_DIR/scored.jsonl"
+PREV_AVG_RATE="$AVG_RATE"
+PREV_EFFECT_COUNT=0
+NO_INFO_STREAK=0
 
 # ===================== Round 1..N: 循环进化 =====================
 for ROUND in $(seq 1 "$MAX_ROUNDS"); do
@@ -278,6 +308,8 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     # 计算本轮平均得分率
     AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
     echo "Round $ROUND 平均得分率: $AVG_RATE"
+    EFFECT_COUNT=$(extract_effect_count "$ROUND_DIR/effect_analysis.jsonl")
+    AVG_DELTA=$(abs_diff_float "$AVG_RATE" "$PREV_AVG_RATE")
 
     ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/scored.jsonl"
     if [ -f "$ROUND_DIR/state_updated.jsonl" ] && [ -s "$ROUND_DIR/state_updated.jsonl" ]; then
@@ -291,11 +323,26 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
         printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "early_stop" >> "$SUMMARY_FILE"
         PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
         break
-    else
-        printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "continue" >> "$SUMMARY_FILE"
     fi
 
+    if [ "$EFFECT_COUNT" -eq 0 ] && [ "$(lt_float "$AVG_DELTA" "$NO_INFO_MIN_DELTA")" = "true" ]; then
+        NO_INFO_STREAK=$((NO_INFO_STREAK + 1))
+    else
+        NO_INFO_STREAK=0
+    fi
+
+    if [ "$NO_INFO_STREAK" -ge "$NO_INFO_STOP_ROUNDS" ]; then
+        echo "提前停止：连续 $NO_INFO_STREAK 轮无新信息（effect_count=0 且 avg_delta=$AVG_DELTA < $NO_INFO_MIN_DELTA）"
+        printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "no_info_stop" >> "$SUMMARY_FILE"
+        PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
+        break
+    fi
+
+    printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "continue" >> "$SUMMARY_FILE"
+
     PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
+    PREV_AVG_RATE="$AVG_RATE"
+    PREV_EFFECT_COUNT="$EFFECT_COUNT"
 done
 
 # ===================== 保存最终结果 =====================
