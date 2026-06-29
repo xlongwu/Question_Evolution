@@ -7,12 +7,16 @@
 ---
 
 ## 1. 整体流程
-
+'''
+后续优化：
+1. 当前项目已经实现了“链式主流程 + 单轮局部多候选探索 + 候选选优”，这可以算局部树状探索的第一版；但还没有实现“多层树展开、节点回溯、分支持续搜索”的完整树搜索。
+2. 当前项目是“只要系统判断这个样本已经形成有效边界，或者不值得再进化，就停止继续改题；停止之后，会以透传方式进入下一轮，并复用上一轮评分结果”。进一步优化方向：docs/树状搜索与回溯式多边界探索改造方案.md
+'''
 当前推荐主流程由 `run_loop.sh` 编排，入口是已完成准入的
-`admitted_seed_samples.jsonl`。脚本仍保留旧输入回退，但正式实验应显式使用准入样本。
+`data.jsonl`。脚本仍保留旧输入回退，但正式实验应显式使用准入样本。
 
 ```text
-Stage 0: admitted_seed_samples.jsonl
+Stage 0: data.jsonl
 Stage 1: scoring.py -> round_0/scored.jsonl
 Stage 2: profile_samples.py -> select_evolution_candidates.py
 Stage 3: operator_router.py -> question_evolution.py
@@ -39,6 +43,99 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 | 11 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
 
 `question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、候选选择、效果统计和状态更新。
+
+### 流程图
+```text
+Stage 0 输入
+  data.jsonl
+        |
+        v
+Round 0 baseline
+  scoring.py
+        |
+        v
+  round_0/scored.jsonl
+  (得到 scoring_result / score_rate)
+        |
+        v
+Round N 输入
+  上一轮 scored.jsonl 或 state_updated.jsonl
+        |
+        v
+  profile_samples.py -> 生成 sample_profile / overscore_diagnosis
+        |
+        v 
+  select_evolution_candidates.py -> 决定 evolution_action
+        |
+        +------------------------------+
+        |                              |
+        | 不需要进化                   | 需要进化
+        | pass_through / stop          | high-score overscore /
+        |                              | low-score boundary reconstruct
+        v                              v
+  保留原题                       operator_router.py
+  question_evolved=false         -> 选择 primary / backup / avoid operators
+        |                              |
+        |                              +<-- operator_memory_bank.jsonl
+        |                              +<-- failure_memory_bank.jsonl
+        |                              +<-- 上一轮 evolution_state
+        |                              |
+        |                              v
+        |                        question_evolution.py
+        |                        -> 按算子生成 1-N 个候选题
+        |                              |
+        |                              v
+        |                        validate_evolved_question.py
+        |                        -> 校验复杂度 / 可答性 / 重复题型
+        |                              |
+        |                              v
+        |                        candidate_selection.py
+        |                        -> 每组候选选 1 条主链题
+        |                              |
+        |                +-------------+-------------+
+        |                |                           |
+        |                | 全部候选不合格            | 选中有效候选
+        |                v                           v
+        +------------> evolved.jsonl <--------------+
+                             |
+                             v
+                    collect_answers.py
+                    -> 为当前 prompt 生成参考答案
+                             |
+                             v
+                    gen_rubric.py
+                    -> 生成新 rubric / score_prompt
+                             |
+                             v
+                    scoring.py
+                    -> 候选模型重新作答并评分
+                             |
+                             v
+                    analyze_evolution_effect.py
+                    -> 比较前后 score_rate 与 focus 命中
+                             |
+                             v
+                    update_sample_state.py
+                    -> 更新 evolution_state
+                    -> 写入 memory bank
+                             |
+                             +--> operator_memory_bank.jsonl
+                             +--> failure_memory_bank.jsonl
+                             +--> invalid_generation_cases.jsonl
+                             +--> state_updated.jsonl
+                                      |
+                                      v
+                           判断平均得分率是否低于
+                           EARLY_STOP_RATE
+                                      |
+                        +-------------+-------------+
+                        |                           |
+                        | 否                        | 是
+                        v                           v
+                 进入下一轮 Round N+1        停止迭代并输出
+                                            final/final_scored.jsonl
+```
+
 
 ### 1.1 脚本职责速查
 
