@@ -266,6 +266,19 @@ def _previous_operator(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _recommended_next_methods(item: Dict[str, Any]) -> List[str]:
+    state = get_evolution_state(item)
+    values = state.get("recommended_next_methods")
+    if not isinstance(values, list):
+        return []
+    operators: List[str] = []
+    for value in values:
+        operator = _normalize_operator(value)
+        if operator and operator not in operators:
+            operators.append(operator)
+    return operators
+
+
 def _is_current_full_score(item: Dict[str, Any], full_score_threshold: float) -> bool:
     score_rate = get_score_rate(item)
     if score_rate is None:
@@ -324,6 +337,7 @@ def build_operator_route(
     primary, backups, reason = _base_rule_route(item)
     avoid: List[str] = []
     reason_parts = [reason]
+    recommended_next = _recommended_next_methods(item)
 
     signature = build_sample_signature(item)
     operator_matches = find_memory_matches(signature, operator_memory)
@@ -353,6 +367,19 @@ def build_operator_route(
         else:
             _append_unique(backups, [O2_SUBCLAIM_LOCALIZATION, O4_NEAR_LEVEL_RANKING, O8_DOUBLE_THRESHOLD_CLAIM])
         reason_parts.append("previous O1 full-score result blocks repeating O1.")
+
+    if recommended_next:
+        ordered_candidates: List[str] = []
+        _append_unique(ordered_candidates, recommended_next)
+        _append_unique(ordered_candidates, [primary])
+        _append_unique(ordered_candidates, backups)
+        ordered_candidates = _remove_values(ordered_candidates, avoid)
+        if ordered_candidates:
+            primary = ordered_candidates[0]
+            backups = ordered_candidates[1:]
+            reason_parts.append(
+                "recommended_next_methods from evolution_state are prioritized before fallback rule routing."
+            )
 
     backups = _remove_values(backups, [primary] if primary else [])
     backups = _remove_values(backups, avoid)
