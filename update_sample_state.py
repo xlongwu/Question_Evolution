@@ -18,6 +18,14 @@ FAILURE_EFFECT_LABELS = {
     "repeated_pattern",
 }
 
+TERMINAL_STOP_STATUSES = {
+    "effective_boundary_sample",
+    "stable_high_score_stop",
+    "validated_high_score_sample",
+    "invalid_complexity_sample",
+    "unanswerable_or_trap_sample",
+}
+
 OPERATOR_AVOID_METHODS = {
     "O1_gap_choice": [
         "继续问最少还缺什么",
@@ -130,6 +138,7 @@ def _stop_status(
     effect = _effect(item)
     label = _clean_text(effect.get("effect_label"))
     previous_stop = _clean_text(_previous_state(item).get("stop_status"))
+    previous_recommended = list(_previous_state(item).get("recommended_next_methods") or [])
 
     if label == "effective_boundary_probe":
         return "effective_boundary_sample"
@@ -140,9 +149,13 @@ def _stop_status(
         return "invalid_complexity_sample"
     if label == "pass_through":
         return previous_stop or "continue"
+    if label == "score_increased":
+        return "validated_high_score_sample"
     if label == "full_score_no_drop":
         if full_score_count >= 2 and operator_switched_after_full_score:
             return "stable_high_score_stop"
+        if previous_recommended:
+            return "continue_with_new_operator"
         return "local_tree_search_needed" if full_score_count >= 2 else "continue_with_new_operator"
     if label == "repeated_pattern":
         return "stable_high_score_stop" if same_operator_count >= 2 else "continue_with_new_operator"
@@ -153,6 +166,8 @@ def _stop_status(
 
 def _recommended_next_methods(operator_used: str, label: str, full_score_count: int) -> List[str]:
     if label == "effective_boundary_probe":
+        return []
+    if label == "score_increased":
         return []
     hints = list(NEXT_OPERATOR_HINTS.get(operator_used, []))
     if full_score_count >= 2 and "O4_near_level_ranking" not in hints:
@@ -184,8 +199,17 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         _append_unique(avoid_methods, OPERATOR_AVOID_METHODS.get(operator_used, []))
 
     recommended = _recommended_next_methods(operator_used, label, full_score_count)
-    if not recommended:
+    if not recommended and label not in {"effective_boundary_probe", "score_increased"}:
         recommended = list(previous_state.get("recommended_next_methods") or [])
+
+    stop_status = _stop_status(
+        item,
+        full_score_count,
+        same_operator_count,
+        operator_switched_after_full_score,
+    )
+    if stop_status in TERMINAL_STOP_STATUSES:
+        recommended = []
 
     return {
         "round": _round_value(item, previous_state),
@@ -197,12 +221,7 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "consecutive_same_operator_count": same_operator_count,
         "avoid_methods": avoid_methods,
         "recommended_next_methods": recommended,
-        "stop_status": _stop_status(
-            item,
-            full_score_count,
-            same_operator_count,
-            operator_switched_after_full_score,
-        ),
+        "stop_status": stop_status,
     }
 
 
