@@ -44,6 +44,7 @@ STOP_TERMS = (
 STOP_STATUSES = {
     "stable_high_score_stop",
     "effective_boundary_sample",
+    "validated_high_score_sample",
     "invalid_complexity_sample",
     "unanswerable_or_trap_sample",
     "stop_evolution",
