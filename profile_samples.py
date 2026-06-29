@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from local_api_config import get_config_list, get_config_value
 from prompts.profile_prompt import build_profile_prompt
+from search_state_contract import DEFAULT_BOUNDARY_AXES, normalize_search_state
 
 
 DEFAULT_PROFILE_MODEL = (
@@ -49,6 +50,21 @@ FORBIDDEN_OPERATOR_KEYS = {
     "backup_operators",
     "operator_route",
     "route_operator",
+}
+BOUNDARY_AXIS_KEYWORDS = (
+    ("反常线索主线切换", ("反常线索", "主线切换", "主线抓偏", "受干扰信息带偏")),
+    ("最关键缺口识别", ("漏最小关键事实", "最小关键事实", "最关键缺口", "选错最关键缺口", "独立必要条件")),
+    ("题干外补设识别", ("题外补设", "题干外", "隐藏前提", "答案写太满超题", "超题")),
+    ("补强项升级判断", ("补强", "线索升级", "抓显眼点漏关键层", "双门槛", "动作层与性质层")),
+    ("结论分层", ("层级越推", "层级混淆", "近似项分层", "判据内", "判据外", "漏关键层")),
+    ("伪闭环识别", ("泛化罗列", "套话", "事实绑定", "闭环", "格式失分")),
+)
+PROFILE_CAPABILITY_AXIS_DEFAULTS = {
+    "证据链补强": ["最关键缺口识别", "补强项升级判断", "伪闭环识别"],
+    "行为模式识别": ["反常线索主线切换", "结论分层", "最关键缺口识别"],
+    "边界判断": ["结论分层", "题干外补设识别", "伪闭环识别"],
+    "反事实推理": ["补强项升级判断", "最关键缺口识别", "结论分层"],
+    "排他性认定": ["最关键缺口识别", "题干外补设识别", "伪闭环识别"],
 }
 
 
@@ -241,6 +257,99 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+def _as_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        raw_values = value
+    elif isinstance(value, str):
+        raw_values = re.split(r"[,，、/|]\s*", value)
+    else:
+        raw_values = []
+
+    values: List[str] = []
+    for item in raw_values:
+        text = _as_clean_string(item, default="")
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def normalize_boundary_axis(value: Any) -> Optional[str]:
+    text = _as_clean_string(value, default="")
+    if not text:
+        return None
+    if text in DEFAULT_BOUNDARY_AXES:
+        return text
+    for axis in DEFAULT_BOUNDARY_AXES:
+        if axis in text or text in axis:
+            return axis
+    for axis, keywords in BOUNDARY_AXIS_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return axis
+    return None
+
+
+def _append_unique_axes(axes: List[str], values: Iterable[Any]) -> None:
+    for value in values:
+        axis = normalize_boundary_axis(value)
+        if axis and axis not in axes:
+            axes.append(axis)
+
+
+def infer_boundary_axis_candidates(
+    sample_profile: Dict[str, Any],
+    overscore_diagnosis: Dict[str, Any],
+) -> List[str]:
+    axes: List[str] = []
+    diagnosis_text = " ".join(
+        _as_clean_string(overscore_diagnosis.get(field), default="")
+        for field in (
+            "candidate_overscore_cause",
+            "target_failure_mode",
+            "why_high_score_is_suspicious",
+        )
+    )
+
+    for axis, keywords in BOUNDARY_AXIS_KEYWORDS:
+        if any(keyword in diagnosis_text for keyword in keywords):
+            axes.append(axis)
+
+    core_capability = _as_clean_string(sample_profile.get("core_capability"), default="")
+    _append_unique_axes(axes, PROFILE_CAPABILITY_AXIS_DEFAULTS.get(core_capability, []))
+    _append_unique_axes(axes, DEFAULT_BOUNDARY_AXES)
+    return axes[:4]
+
+
+def collect_already_explored_axes(item: Dict[str, Any]) -> List[str]:
+    state = normalize_search_state(item)
+    axes: List[str] = []
+    _append_unique_axes(axes, state.get("already_explored_axes", []))
+
+    discovered = state.get("discovered_boundaries")
+    if isinstance(discovered, list):
+        for boundary in discovered:
+            if isinstance(boundary, dict):
+                _append_unique_axes(axes, [boundary.get("boundary_axis")])
+
+    branch_status = str(state.get("branch_status") or "")
+    if branch_status in {"boundary_hit", "exhausted", "duplicate", "invalid"}:
+        _append_unique_axes(axes, [state.get("boundary_axis")])
+    return axes
+
+
+def compute_next_best_axes(
+    boundary_axis_candidates: Iterable[Any],
+    already_explored_axes: Iterable[Any],
+    *,
+    is_worth_evolving: bool = True,
+) -> List[str]:
+    if not is_worth_evolving:
+        return []
+    explored = {axis for axis in (normalize_boundary_axis(value) for value in already_explored_axes) if axis}
+    next_axes: List[str] = []
+    _append_unique_axes(next_axes, boundary_axis_candidates)
+    return [axis for axis in next_axes if axis not in explored][:4]
+
+
 def normalize_profile_payload(parsed: Dict[str, Any]) -> Dict[str, Any]:
     forbidden = find_forbidden_operator_keys(parsed)
     if forbidden:
@@ -265,6 +374,19 @@ def normalize_profile_payload(parsed: Dict[str, Any]) -> Dict[str, Any]:
     )
     for field in DIAGNOSIS_REQUIRED_STRING_FIELDS:
         overscore_diagnosis[field] = _as_clean_string(overscore_diagnosis.get(field))
+
+    raw_axis_candidates = _as_string_list(sample_profile.get("boundary_axis_candidates"))
+    boundary_axis_candidates: List[str] = []
+    _append_unique_axes(boundary_axis_candidates, raw_axis_candidates)
+    if not boundary_axis_candidates:
+        boundary_axis_candidates = infer_boundary_axis_candidates(sample_profile, overscore_diagnosis)
+    sample_profile["boundary_axis_candidates"] = boundary_axis_candidates[:4]
+    sample_profile["already_explored_axes"] = []
+    sample_profile["next_best_axes"] = compute_next_best_axes(
+        sample_profile["boundary_axis_candidates"],
+        [],
+        is_worth_evolving=bool(overscore_diagnosis.get("is_worth_evolving")),
+    )
 
     return {
         "sample_profile": sample_profile,
@@ -404,8 +526,23 @@ def attach_profile_result(
     raw_response: str,
 ) -> Dict[str, Any]:
     result = dict(item)
-    result["sample_profile"] = profile_result["sample_profile"]
+    sample_profile = dict(profile_result["sample_profile"])
+    already_explored_axes = collect_already_explored_axes(result)
+    next_best_axes = compute_next_best_axes(
+        sample_profile.get("boundary_axis_candidates", []),
+        already_explored_axes,
+        is_worth_evolving=bool(profile_result["overscore_diagnosis"].get("is_worth_evolving")),
+    )
+    sample_profile["already_explored_axes"] = already_explored_axes
+    sample_profile["next_best_axes"] = next_best_axes
+
+    state = normalize_search_state(result)
+    state["already_explored_axes"] = already_explored_axes
+    state["recommended_next_axes"] = next_best_axes
+
+    result["sample_profile"] = sample_profile
     result["overscore_diagnosis"] = profile_result["overscore_diagnosis"]
+    result["evolution_state"] = state
     result["profile_metadata"] = {
         "profile_model": model,
         "profile_raw_response": raw_response,

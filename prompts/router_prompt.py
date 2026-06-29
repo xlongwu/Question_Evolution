@@ -23,6 +23,7 @@ def build_router_prompt(record: Dict[str, Any], memory_summary: Optional[Dict[st
         "overscore_diagnosis": record.get("overscore_diagnosis", {}),
         "evolution_state": record.get("evolution_state", {}),
         "evolution_action": record.get("evolution_action"),
+        "tree_search_decision": record.get("tree_search_decision", {}),
         "score_rate": record.get("score_rate"),
         "memory_summary": memory_summary or {},
     }
@@ -45,7 +46,12 @@ def build_router_prompt(record: Dict[str, Any], memory_summary: Optional[Dict[st
     "avoid_operators": [],
     "routing_reason": "简要说明为什么选择该 operator",
     "is_high_value_sample": true,
-    "should_use_local_tree_search": false
+    "should_use_local_tree_search": false,
+    "branch_intent": "expand_current_branch",
+    "branch_action": "expand_current_branch",
+    "source_node_type": "current",
+    "target_boundary_axis": "最关键缺口识别",
+    "stop_reason": null
   }}
 }}
 """.strip()

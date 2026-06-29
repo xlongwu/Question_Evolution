@@ -60,6 +60,36 @@
         "stop_evolution"
       ]
     },
+    "tree_search_decision": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "action_type": {
+          "enum": [
+            "expand_current_branch",
+            "fork_from_root",
+            "fork_from_parent",
+            "stop_branch",
+            "stop_sample"
+          ]
+        },
+        "branch_intent": {
+          "type": "string"
+        },
+        "source_node_type": {
+          "enum": ["current", "root", "parent"]
+        },
+        "target_boundary_axis": {
+          "type": ["string", "null"]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "stop_reason": {
+          "type": "string"
+        }
+      }
+    },
     "operator_route": {
       "type": "object",
       "additionalProperties": true,
@@ -87,6 +117,42 @@
         },
         "should_use_local_tree_search": {
           "type": "boolean"
+        },
+        "branch_intent": {
+          "type": "string"
+        },
+        "branch_action": {
+          "enum": [
+            "expand_current_branch",
+            "fork_from_root",
+            "fork_from_parent",
+            "stop_branch",
+            "stop_sample"
+          ]
+        },
+        "source_node_type": {
+          "enum": ["current", "root", "parent"]
+        },
+        "target_boundary_axis": {
+          "type": ["string", "null"]
+        },
+        "boundary_axis": {
+          "type": ["string", "null"]
+        },
+        "already_explored_axes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_best_axes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "stop_reason": {
+          "type": ["string", "null"]
         }
       }
     },

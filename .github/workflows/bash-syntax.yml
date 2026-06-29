@@ -1,0 +1,14 @@
+name: Bash Syntax
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  run-loop-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check run_loop.sh syntax
+        shell: bash
+        run: bash -n run_loop.sh

@@ -56,6 +56,33 @@
     },
     "effect_label": {
       "type": "string"
+    },
+    "target_boundary_axis": {
+      "type": ["string", "null"]
+    },
+    "boundary_axis_detected": {
+      "type": ["string", "null"]
+    },
+    "boundary_axis_mismatch": {
+      "type": "boolean"
+    },
+    "boundary_axis_audit_reason": {
+      "type": "string"
+    },
+    "structural_boundary_signal": {
+      "type": "boolean"
+    },
+    "dedup_signature": {
+      "type": "string"
+    },
+    "duplicate_boundary_for_sample": {
+      "type": "boolean"
+    },
+    "is_new_boundary_for_sample": {
+      "type": "boolean"
+    },
+    "boundary_candidate_status": {
+      "type": "string"
     }
   }
 }

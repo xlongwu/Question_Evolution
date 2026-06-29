@@ -5,11 +5,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
+    EXPAND_CURRENT_BRANCH,
+    FORK_FROM_PARENT,
+    FORK_FROM_ROOT,
     PASS_THROUGH_OR_SCORING_NOISE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
     STOP_EVOLUTION,
+    STOP_BRANCH,
+    STOP_SAMPLE,
     get_score_rate,
 )
+from search_state_contract import DEFAULT_BOUNDARY_AXES, normalize_search_state
 
 
 O1_GAP_CHOICE = "O1_gap_choice"
@@ -49,6 +55,46 @@ SIGNATURE_FIELDS = (
     "claim_level",
     "problem_shape",
     "candidate_overscore_cause",
+)
+BOUNDARY_AXIS_OPERATOR_RULES = {
+    "最关键缺口识别": (
+        O1_GAP_CHOICE,
+        [O2_SUBCLAIM_LOCALIZATION, O8_DOUBLE_THRESHOLD_CLAIM],
+        "target boundary axis maps to key-gap identification.",
+    ),
+    "结论分层": (
+        O4_NEAR_LEVEL_RANKING,
+        [O3_STEP_JUMP, O8_DOUBLE_THRESHOLD_CLAIM],
+        "target boundary axis maps to conclusion-level separation.",
+    ),
+    "伪闭环识别": (
+        O7_FACT_BINDING_CONSTRAINT,
+        [O1_GAP_CHOICE, O2_SUBCLAIM_LOCALIZATION],
+        "target boundary axis maps to pseudo-closure detection.",
+    ),
+    "补强项升级判断": (
+        O8_DOUBLE_THRESHOLD_CLAIM,
+        [O3_STEP_JUMP, O4_NEAR_LEVEL_RANKING],
+        "target boundary axis maps to reinforcement upgrade judgment.",
+    ),
+    "题干外补设识别": (
+        O5_EXTRA_PREMISE_DETECTION,
+        [O7_FACT_BINDING_CONSTRAINT],
+        "target boundary axis maps to extra-premise detection.",
+    ),
+    "反常线索主线切换": (
+        O9_ABNORMAL_CLUE_MAINLINE_SWITCH,
+        [O6_SINGLE_VARIABLE_COUNTERFACTUAL],
+        "target boundary axis maps to abnormal-clue mainline switching.",
+    ),
+}
+BOUNDARY_AXIS_KEYWORDS = (
+    ("反常线索主线切换", ("反常线索", "主线切换", "主线抓偏", "受干扰信息带偏")),
+    ("最关键缺口识别", ("漏最小关键事实", "最小关键事实", "最关键缺口", "选错最关键缺口", "独立必要条件")),
+    ("题干外补设识别", ("题外补设", "题干外", "隐藏前提", "答案写太满超题", "超题")),
+    ("补强项升级判断", ("补强", "线索升级", "抓显眼点漏关键层", "双门槛", "动作层与性质层")),
+    ("结论分层", ("层级越推", "层级混淆", "近似项分层", "判据内", "判据外", "漏关键层")),
+    ("伪闭环识别", ("泛化罗列", "套话", "事实绑定", "闭环", "格式失分")),
 )
 
 
@@ -109,6 +155,41 @@ def _normalize_operator(value: Any) -> Optional[str]:
     return text if text in OPERATOR_IDS else None
 
 
+def _unique_strings(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    values: List[str] = []
+    for item in value:
+        text = _clean_text(item)
+        if text and text not in values:
+            values.append(text)
+    return values
+
+
+def normalize_boundary_axis(value: Any) -> Optional[str]:
+    text = _clean_text(value)
+    if not text:
+        return None
+    if text in DEFAULT_BOUNDARY_AXES:
+        return text
+    for axis in DEFAULT_BOUNDARY_AXES:
+        if axis in text or text in axis:
+            return axis
+    for axis, keywords in BOUNDARY_AXIS_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return axis
+    return None
+
+
+def _normalize_axis_list(values: Sequence[Any]) -> List[str]:
+    axes: List[str] = []
+    for value in values:
+        axis = normalize_boundary_axis(value)
+        if axis and axis not in axes:
+            axes.append(axis)
+    return axes
+
+
 def get_evolution_action(item: Dict[str, Any]) -> str:
     return _clean_text(item.get("evolution_action"))
 
@@ -134,6 +215,11 @@ def get_overscore_diagnosis(item: Dict[str, Any]) -> Dict[str, Any]:
 def get_evolution_state(item: Dict[str, Any]) -> Dict[str, Any]:
     state = item.get("evolution_state")
     return state if isinstance(state, dict) else {}
+
+
+def get_tree_search_decision(item: Dict[str, Any]) -> Dict[str, Any]:
+    decision = item.get("tree_search_decision")
+    return decision if isinstance(decision, dict) else {}
 
 
 def build_sample_signature(item: Dict[str, Any]) -> Dict[str, str]:
@@ -252,6 +338,125 @@ def _base_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], st
     )
 
 
+def _infer_boundary_axis_from_record(item: Dict[str, Any]) -> Optional[str]:
+    state = normalize_search_state(item)
+    axis = normalize_boundary_axis(state.get("boundary_axis"))
+    if axis:
+        return axis
+
+    profile = item.get("sample_profile")
+    if isinstance(profile, dict):
+        for field in ("next_best_axes", "boundary_axis_candidates"):
+            axes = _normalize_axis_list(_unique_strings(profile.get(field)))
+            if axes:
+                return axes[0]
+
+    diagnosis = get_overscore_diagnosis(item)
+    text = " ".join(
+        _clean_text(diagnosis.get(field))
+        for field in (
+            "candidate_overscore_cause",
+            "target_failure_mode",
+            "why_high_score_is_suspicious",
+        )
+    )
+    return normalize_boundary_axis(text)
+
+
+def _already_explored_axes(item: Dict[str, Any]) -> List[str]:
+    axes: List[str] = []
+    profile = item.get("sample_profile")
+    if isinstance(profile, dict):
+        axes.extend(_normalize_axis_list(_unique_strings(profile.get("already_explored_axes"))))
+
+    state = normalize_search_state(item)
+    axes.extend(_normalize_axis_list(_unique_strings(state.get("already_explored_axes"))))
+    discovered = state.get("discovered_boundaries")
+    if isinstance(discovered, list):
+        for boundary in discovered:
+            if isinstance(boundary, dict):
+                axis = normalize_boundary_axis(boundary.get("boundary_axis"))
+                if axis:
+                    axes.append(axis)
+
+    unique: List[str] = []
+    for axis in axes:
+        if axis not in unique:
+            unique.append(axis)
+    return unique
+
+
+def _next_best_axes(item: Dict[str, Any]) -> List[str]:
+    profile = item.get("sample_profile")
+    if isinstance(profile, dict):
+        axes = _normalize_axis_list(_unique_strings(profile.get("next_best_axes")))
+        if "next_best_axes" in profile:
+            return axes
+        if axes:
+            return axes
+
+    state = normalize_search_state(item)
+    axes = _normalize_axis_list(_unique_strings(state.get("recommended_next_axes")))
+    if axes:
+        return axes
+
+    inferred = _infer_boundary_axis_from_record(item)
+    return [inferred] if inferred else []
+
+
+def choose_target_boundary_axis(item: Dict[str, Any]) -> Optional[str]:
+    decision = get_tree_search_decision(item)
+    decision_axis = normalize_boundary_axis(decision.get("target_boundary_axis"))
+    already_explored = set(_already_explored_axes(item))
+    next_axes = _next_best_axes(item)
+
+    if decision_axis and (
+        decision_axis not in already_explored
+        or decision.get("action_type") == EXPAND_CURRENT_BRANCH
+    ):
+        return decision_axis
+
+    for axis in next_axes:
+        if axis not in already_explored:
+            return axis
+
+    return decision_axis or (next_axes[0] if next_axes else _infer_boundary_axis_from_record(item))
+
+
+def _tree_decision_fields(item: Dict[str, Any], action: str) -> Dict[str, Any]:
+    decision = get_tree_search_decision(item)
+    action_type = _clean_text(decision.get("action_type"))
+    if not action_type:
+        action_type = STOP_SAMPLE if action == STOP_EVOLUTION else EXPAND_CURRENT_BRANCH
+        if action == PASS_THROUGH_OR_SCORING_NOISE:
+            action_type = STOP_BRANCH
+
+    source_node_type = _clean_text(decision.get("source_node_type"))
+    if source_node_type not in {"current", "root", "parent"}:
+        if action_type == FORK_FROM_ROOT:
+            source_node_type = "root"
+        elif action_type == FORK_FROM_PARENT:
+            source_node_type = "parent"
+        else:
+            source_node_type = "current"
+
+    return {
+        "branch_intent": _clean_text(decision.get("branch_intent")) or action_type,
+        "branch_action": action_type,
+        "source_node_type": source_node_type,
+        "stop_reason": _clean_text(decision.get("stop_reason")) or None,
+    }
+
+
+def _axis_rule_route(item: Dict[str, Any]) -> Tuple[Optional[str], List[str], str, Optional[str]]:
+    axis = choose_target_boundary_axis(item)
+    if axis and axis in BOUNDARY_AXIS_OPERATOR_RULES:
+        primary, backups, reason = BOUNDARY_AXIS_OPERATOR_RULES[axis]
+        return primary, list(backups), reason, axis
+    primary, backups, reason = _base_rule_route(item)
+    return primary, list(backups), reason, axis
+
+
 def _previous_operator(item: Dict[str, Any]) -> Optional[str]:
     state = get_evolution_state(item)
     operator = _normalize_operator(state.get("previous_operator"))
@@ -318,6 +523,10 @@ def build_operator_route(
     full_score_threshold: float = 0.99,
 ) -> Dict[str, Any]:
     action = get_evolution_action(item)
+    decision_fields = _tree_decision_fields(item, action)
+    target_axis = choose_target_boundary_axis(item)
+    already_explored_axes = _already_explored_axes(item)
+    next_best_axes = _next_best_axes(item)
     if action in NON_EVOLUTION_ACTIONS:
         return {
             "primary_operator": None,
@@ -326,6 +535,14 @@ def build_operator_route(
             "routing_reason": f"evolution_action={action} does not require question evolution.",
             "is_high_value_sample": False,
             "should_use_local_tree_search": False,
+            "branch_intent": decision_fields["branch_intent"],
+            "branch_action": decision_fields["branch_action"],
+            "source_node_type": decision_fields["source_node_type"],
+            "target_boundary_axis": target_axis,
+            "boundary_axis": target_axis,
+            "already_explored_axes": already_explored_axes,
+            "next_best_axes": next_best_axes,
+            "stop_reason": decision_fields["stop_reason"] or action,
             "memory_matches": {"operator": [], "failure": []},
         }
     if action and action not in EVOLUTION_REQUIRED_ACTIONS:
@@ -334,7 +551,7 @@ def build_operator_route(
     get_sample_profile(item)
     get_overscore_diagnosis(item)
 
-    primary, backups, reason = _base_rule_route(item)
+    primary, backups, reason, target_axis = _axis_rule_route(item)
     avoid: List[str] = []
     reason_parts = [reason]
     recommended_next = _recommended_next_methods(item)
@@ -396,6 +613,7 @@ def build_operator_route(
         _is_high_value_sample(item)
         or action == RECONSTRUCT_LOW_SCORE_BOUNDARY
         or consecutive_full >= 2
+        or decision_fields["branch_action"] in {FORK_FROM_ROOT, FORK_FROM_PARENT}
     )
 
     return {
@@ -405,6 +623,14 @@ def build_operator_route(
         "routing_reason": " ".join(reason_parts),
         "is_high_value_sample": _is_high_value_sample(item),
         "should_use_local_tree_search": should_tree,
+        "branch_intent": decision_fields["branch_intent"],
+        "branch_action": decision_fields["branch_action"],
+        "source_node_type": decision_fields["source_node_type"],
+        "target_boundary_axis": target_axis,
+        "boundary_axis": target_axis,
+        "already_explored_axes": already_explored_axes,
+        "next_best_axes": next_best_axes,
+        "stop_reason": decision_fields["stop_reason"],
         "memory_matches": {
             "operator": operator_matches[:3],
             "failure": failure_matches[:3],

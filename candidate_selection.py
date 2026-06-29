@@ -4,6 +4,8 @@ import os
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from analyze_evolution_effect import build_boundary_dedup_signature
+
 
 RISK_SCORE = {"low": 0, "medium": -5, "high": -25}
 
@@ -43,6 +45,11 @@ def _metadata(item: Dict[str, Any]) -> Dict[str, Any]:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _effect_analysis(item: Dict[str, Any]) -> Dict[str, Any]:
+    effect = item.get("effect_analysis")
+    return effect if isinstance(effect, dict) else {}
+
+
 def candidate_group_id(item: Dict[str, Any]) -> str:
     for field in ("candidate_group_id", "sample_id", "index"):
         value = item.get(field)
@@ -71,6 +78,55 @@ def validation_result(item: Dict[str, Any]) -> Dict[str, Any]:
     return result if isinstance(result, dict) else {"passed": False, "reject_reason": "缺少 validation_result"}
 
 
+def boundary_selection_flags(item: Dict[str, Any]) -> Dict[str, Any]:
+    effect = _effect_analysis(item)
+    dedup_signature = _clean_text(effect.get("dedup_signature")) or build_boundary_dedup_signature(item)
+    duplicate = bool(effect.get("duplicate_boundary_for_sample") or effect.get("discard_as_duplicate"))
+    is_new_boundary = bool(effect.get("is_new_boundary_for_sample"))
+    effect_label = _clean_text(effect.get("effect_label"))
+    hit_confidence = _clean_text(effect.get("hit_confidence"))
+
+    selected_as_boundary_leaf = is_new_boundary
+    selected_into_mainline = not duplicate
+    if (
+        selected_as_boundary_leaf
+        and effect_label == "effective_boundary_probe"
+        and hit_confidence in {"medium", "high"}
+    ):
+        selected_into_mainline = False
+
+    return {
+        "selected_into_mainline": selected_into_mainline,
+        "selected_as_boundary_leaf": selected_as_boundary_leaf,
+        "discard_as_duplicate": duplicate,
+        "dedup_signature": dedup_signature,
+        "boundary_axis_detected": effect.get("boundary_axis_detected"),
+        "target_boundary_axis": effect.get("target_boundary_axis"),
+        "boundary_candidate_status": effect.get("boundary_candidate_status"),
+    }
+
+
+def attach_boundary_selection_flags(item: Dict[str, Any], flags: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(item)
+    for field in (
+        "selected_into_mainline",
+        "selected_as_boundary_leaf",
+        "discard_as_duplicate",
+        "dedup_signature",
+    ):
+        result[field] = flags[field]
+    return result
+
+
+def passthrough_selection_flags(item: Dict[str, Any]) -> Dict[str, Any]:
+    flags = boundary_selection_flags(item)
+    flags["selected_into_mainline"] = True
+    flags["selected_as_boundary_leaf"] = False
+    flags["discard_as_duplicate"] = False
+    flags["boundary_candidate_status"] = None
+    return flags
+
+
 def _risk_penalty(validation: Dict[str, Any], field: str) -> int:
     return RISK_SCORE.get(_clean_text(validation.get(field)), -10)
 
@@ -80,6 +136,9 @@ def score_candidate(item: Dict[str, Any]) -> Tuple[int, List[str]]:
     reasons: List[str] = []
     if not validation.get("passed"):
         return -10_000, [_clean_text(validation.get("reject_reason")) or "未通过复杂度校验"]
+    flags = boundary_selection_flags(item)
+    if flags["discard_as_duplicate"]:
+        return -10_000, ["与同一样本已沉淀的能力边界重复"]
 
     score = 100
     main_axis_count = int(validation.get("main_axis_count", 1) or 0)
@@ -121,17 +180,29 @@ def score_candidate(item: Dict[str, Any]) -> Tuple[int, List[str]]:
         score += 3
         reasons.append("保留 expected_evaluation_focus 元数据")
 
+    effect = _effect_analysis(item)
+    if effect.get("is_new_boundary_for_sample"):
+        score += 20
+        reasons.append("形成新的能力边界候选")
+    elif effect.get("structural_boundary_signal"):
+        score += 6
+        reasons.append("存在结构性边界信号，需保留审计")
+
     return score, reasons
 
 
 def build_rejected_candidate(item: Dict[str, Any], fallback_index: int, *, forced_reason: Optional[str] = None) -> Dict[str, Any]:
     validation = validation_result(item)
     reason = forced_reason or _clean_text(validation.get("reject_reason")) or "未被选中"
+    flags = boundary_selection_flags(item)
     return {
         "candidate_id": candidate_id(item, fallback_index),
         "operator_used": candidate_operator(item),
         "reject_reason": reason,
         "validation_result": validation,
+        "discard_as_duplicate": flags["discard_as_duplicate"],
+        "selected_as_boundary_leaf": False,
+        "dedup_signature": flags["dedup_signature"],
     }
 
 
@@ -181,11 +252,14 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
     if len(records) == 1 and records[0].get("question_evolved") is False:
         selected = _strip_candidate_fields(records[0])
         cid = candidate_id(records[0], 1)
+        flags = passthrough_selection_flags(records[0])
+        selected = attach_boundary_selection_flags(selected, flags)
         selected["candidate_selection"] = {
             "selected_candidate_id": cid,
             "selected_operator": "",
             "selection_reason": "透传样本不参与候选选择。",
             "rejected_candidates": [],
+            **flags,
         }
         return selected, []
 
@@ -201,6 +275,8 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
 
     if best_score < 0:
         selected = _strip_candidate_fields(_restore_original_passthrough(records[0]))
+        flags = passthrough_selection_flags(records[0])
+        selected = attach_boundary_selection_flags(selected, flags)
         selected["candidate_selection"] = {
             "selected_candidate_id": candidate_id(records[0], 1),
             "selected_operator": "",
@@ -209,6 +285,7 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
                 build_rejected_candidate(record, index)
                 for index, record in enumerate(records, start=1)
             ],
+            **flags,
         }
         for index, record in enumerate(records, start=1):
             invalid_cases.append(build_invalid_case(record, index))
@@ -217,10 +294,15 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
     selected = _strip_candidate_fields(best_record)
     selected_id = candidate_id(best_record, best_index)
     selected_operator = candidate_operator(best_record)
+    selected_flags = boundary_selection_flags(best_record)
+    selected = attach_boundary_selection_flags(selected, selected_flags)
 
     for _, _, index, record in scored[1:]:
         reason = "低于入选候选的综合选择分"
-        if not validation_result(record).get("passed"):
+        record_flags = boundary_selection_flags(record)
+        if record_flags["discard_as_duplicate"]:
+            reason = "与同一样本已沉淀的能力边界重复"
+        elif not validation_result(record).get("passed"):
             reason = _clean_text(validation_result(record).get("reject_reason")) or reason
             invalid_cases.append(build_invalid_case(record, index, reason=reason))
         rejected_candidates.append(build_rejected_candidate(record, index, forced_reason=reason))
@@ -230,6 +312,7 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
         "selected_operator": selected_operator,
         "selection_reason": "；".join(best_reasons) if best_reasons else "通过复杂度校验且综合分最高。",
         "rejected_candidates": rejected_candidates,
+        **selected_flags,
     }
     return selected, invalid_cases
 

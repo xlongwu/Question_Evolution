@@ -43,6 +43,82 @@
         "type": "string"
       }
     },
+    "search_root_id": {
+      "type": ["string", "null"],
+      "description": "Stable root node id for one original sample search tree."
+    },
+    "current_node_id": {
+      "type": ["string", "null"],
+      "description": "Current prompt node id in the search tree."
+    },
+    "parent_node_id": {
+      "type": ["string", "null"],
+      "description": "Parent node id for the current prompt node; null for root."
+    },
+    "branch_id": {
+      "type": ["string", "null"],
+      "description": "Logical branch id within one sample search tree."
+    },
+    "boundary_axis": {
+      "type": ["string", "null"],
+      "description": "Target capability boundary axis for the current branch."
+    },
+    "branch_status": {
+      "enum": ["exploring", "boundary_hit", "exhausted", "duplicate", "invalid", null]
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "branch_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "discovered_boundaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "boundary_id": {
+            "type": "string"
+          },
+          "boundary_axis": {
+            "type": "string"
+          },
+          "trigger_node_id": {
+            "type": "string"
+          },
+          "effect_label": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "recommended_next_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "already_explored_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "no_new_boundary_rounds": {
+      "type": "integer",
+      "minimum": 0
+    },
     "stop_status": {
       "enum": [
         "continue",
@@ -50,8 +126,16 @@
         "invalid_complexity_sample",
         "unanswerable_or_trap_sample",
         "stable_high_score_stop",
+        "validated_high_score_sample",
         "continue_with_new_operator",
-        "local_tree_search_needed"
+        "local_tree_search_needed",
+        "continue_branch_search",
+        "stop_branch",
+        "branch_exhausted",
+        "stop_sample",
+        "sample_budget_exhausted",
+        "sample_boundary_limit_reached",
+        "no_new_boundary_stop"
       ]
     }
   }

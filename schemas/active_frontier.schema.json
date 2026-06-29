@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Active Frontier Node",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "sample_id",
+    "search_root_id",
+    "frontier_node_id",
+    "source_node_id",
+    "source_node_type",
+    "source_prompt",
+    "prompt_source",
+    "action_type",
+    "branch_id",
+    "target_boundary_axis",
+    "search_depth",
+    "next_depth",
+    "max_search_depth",
+    "branch_budget_remaining",
+    "sample_budget_remaining"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": ["string", "number", "integer"]
+    },
+    "search_root_id": {
+      "type": "string"
+    },
+    "frontier_node_id": {
+      "type": "string"
+    },
+    "source_node_id": {
+      "type": "string"
+    },
+    "source_node_type": {
+      "enum": ["current", "root", "parent"]
+    },
+    "source_prompt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "prompt_source": {
+      "type": "string"
+    },
+    "action_type": {
+      "enum": [
+        "expand_current_branch",
+        "fork_from_root",
+        "fork_from_parent",
+        "stop_branch",
+        "stop_sample"
+      ]
+    },
+    "branch_id": {
+      "type": "string"
+    },
+    "target_boundary_axis": {
+      "type": "string",
+      "minLength": 1
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "branch_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "discovered_boundary_count": {
+      "type": "integer",
+      "minimum": 0
+    }
+  }
+}

@@ -14,6 +14,27 @@
     "selection_reason": {
       "type": "string"
     },
+    "selected_into_mainline": {
+      "type": "boolean"
+    },
+    "selected_as_boundary_leaf": {
+      "type": "boolean"
+    },
+    "discard_as_duplicate": {
+      "type": "boolean"
+    },
+    "dedup_signature": {
+      "type": "string"
+    },
+    "boundary_axis_detected": {
+      "type": ["string", "null"]
+    },
+    "target_boundary_axis": {
+      "type": ["string", "null"]
+    },
+    "boundary_candidate_status": {
+      "type": ["string", "null"]
+    },
     "rejected_candidates": {
       "type": "array",
       "items": {
@@ -25,6 +46,15 @@
             "type": "string"
           },
           "reject_reason": {
+            "type": "string"
+          },
+          "discard_as_duplicate": {
+            "type": "boolean"
+          },
+          "selected_as_boundary_leaf": {
+            "type": "boolean"
+          },
+          "dedup_signature": {
             "type": "string"
           }
         }

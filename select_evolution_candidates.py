@@ -3,6 +3,8 @@ import json
 import os
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from search_state_contract import FRONTIER_ACTION_TYPES, normalize_search_state
+
 
 EVOLVE_HIGH_SCORE_OVERSCORE = "evolve_high_score_overscore"
 RECONSTRUCT_LOW_SCORE_BOUNDARY = "reconstruct_low_score_boundary"
@@ -15,6 +17,12 @@ EVOLUTION_ACTIONS = {
     PASS_THROUGH_OR_SCORING_NOISE,
     STOP_EVOLUTION,
 }
+EXPAND_CURRENT_BRANCH = "expand_current_branch"
+FORK_FROM_ROOT = "fork_from_root"
+FORK_FROM_PARENT = "fork_from_parent"
+STOP_BRANCH = "stop_branch"
+STOP_SAMPLE = "stop_sample"
+TREE_SEARCH_ACTIONS = FRONTIER_ACTION_TYPES
 
 LOW_SCORE_BOUNDARY_TERMS = (
     "低分真实边界",
@@ -127,6 +135,167 @@ def _stop_status(item: Dict[str, Any]) -> str:
     return str(state.get("stop_status", "")).strip()
 
 
+def _clean_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _as_axis_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    axes: List[str] = []
+    for item in value:
+        text = _clean_text(item)
+        if text and text not in axes:
+            axes.append(text)
+    return axes
+
+
+def _next_best_axes(item: Dict[str, Any]) -> List[str]:
+    profile = item.get("sample_profile")
+    if isinstance(profile, dict):
+        axes = _as_axis_list(profile.get("next_best_axes"))
+        if "next_best_axes" in profile:
+            return axes
+        if axes:
+            return axes
+        axes = _as_axis_list(profile.get("boundary_axis_candidates"))
+        if axes:
+            explored = set(_as_axis_list(profile.get("already_explored_axes")))
+            return [axis for axis in axes if axis not in explored]
+
+    state = normalize_search_state(item)
+    return _as_axis_list(state.get("recommended_next_axes"))
+
+
+def _target_boundary_axis(item: Dict[str, Any]) -> Optional[str]:
+    axes = _next_best_axes(item)
+    if axes:
+        return axes[0]
+    state = normalize_search_state(item)
+    return _clean_text(state.get("boundary_axis")) or None
+
+
+def _source_node_type_for(action_type: str) -> str:
+    if action_type == FORK_FROM_ROOT:
+        return "root"
+    if action_type == FORK_FROM_PARENT:
+        return "parent"
+    return "current"
+
+
+def _decision(
+    action_type: str,
+    reason: str,
+    *,
+    target_boundary_axis: Optional[str] = None,
+    stop_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    if action_type not in TREE_SEARCH_ACTIONS:
+        raise ValueError(f"unsupported tree search action: {action_type}")
+    decision: Dict[str, Any] = {
+        "action_type": action_type,
+        "branch_intent": action_type,
+        "source_node_type": _source_node_type_for(action_type),
+        "target_boundary_axis": target_boundary_axis,
+        "reason": reason,
+    }
+    if stop_reason:
+        decision["stop_reason"] = stop_reason
+    return decision
+
+
+def decide_tree_search_action(
+    item: Dict[str, Any],
+    evolution_action: str,
+) -> Dict[str, Any]:
+    state = normalize_search_state(item)
+    next_axes = _next_best_axes(item)
+    target_axis = _target_boundary_axis(item)
+    branch_budget = int(state.get("branch_budget_remaining", 0) or 0)
+    sample_budget = int(state.get("sample_budget_remaining", 0) or 0)
+    search_depth = int(state.get("search_depth", 0) or 0)
+    max_depth = int(state.get("max_search_depth", 0) or 0)
+    branch_status = _clean_text(state.get("branch_status"))
+    stop_status = _clean_text(state.get("stop_status"))
+    current_axis = _clean_text(state.get("boundary_axis"))
+    profile = item.get("sample_profile")
+    explored_axes = set(_as_axis_list(state.get("already_explored_axes")))
+    if isinstance(profile, dict):
+        explored_axes.update(_as_axis_list(profile.get("already_explored_axes")))
+
+    if stop_status in STOP_STATUSES or evolution_action == STOP_EVOLUTION:
+        return _decision(
+            STOP_SAMPLE,
+            "legacy stop status or selector action indicates a terminal sample.",
+            target_boundary_axis=target_axis,
+            stop_reason=stop_status or evolution_action,
+        )
+
+    if sample_budget <= 0:
+        return _decision(
+            STOP_SAMPLE,
+            "sample_budget_remaining is exhausted.",
+            target_boundary_axis=target_axis,
+            stop_reason="sample_budget_exhausted",
+        )
+
+    if not next_axes:
+        return _decision(
+            STOP_SAMPLE,
+            "no unexplored boundary axes are available.",
+            target_boundary_axis=target_axis,
+            stop_reason="no_unexplored_boundary_axis",
+        )
+
+    if evolution_action == PASS_THROUGH_OR_SCORING_NOISE:
+        return _decision(
+            STOP_BRANCH,
+            "current branch is classified as pass-through or scoring noise.",
+            target_boundary_axis=target_axis,
+            stop_reason="non_evolvable_current_branch",
+        )
+
+    if branch_status == "boundary_hit":
+        if state.get("parent_node_id") and search_depth > 1:
+            return _decision(
+                FORK_FROM_PARENT,
+                "current branch already hit a boundary; backtrack to parent for sibling branch.",
+                target_boundary_axis=target_axis,
+            )
+        return _decision(
+            FORK_FROM_ROOT,
+            "current branch already hit a boundary; fork a new root branch for another axis.",
+            target_boundary_axis=target_axis,
+        )
+
+    if branch_status in {"exhausted", "duplicate", "invalid"}:
+        return _decision(
+            FORK_FROM_PARENT if state.get("parent_node_id") else FORK_FROM_ROOT,
+            f"current branch_status={branch_status} should not keep expanding.",
+            target_boundary_axis=target_axis,
+        )
+
+    if branch_budget <= 0 or (max_depth > 0 and search_depth >= max_depth):
+        return _decision(
+            FORK_FROM_PARENT if state.get("parent_node_id") else FORK_FROM_ROOT,
+            "current branch depth or branch budget is exhausted; open another branch.",
+            target_boundary_axis=target_axis,
+        )
+
+    if explored_axes and target_axis and target_axis != current_axis:
+        return _decision(
+            FORK_FROM_PARENT if state.get("parent_node_id") else FORK_FROM_ROOT,
+            "another axis has already been explored; open a separate branch for the next axis.",
+            target_boundary_axis=target_axis,
+        )
+
+    return _decision(
+        EXPAND_CURRENT_BRANCH,
+        "current branch is evolvable and still has branch budget.",
+        target_boundary_axis=target_axis,
+    )
+
+
 def validate_profiled_record(item: Dict[str, Any]) -> None:
     if not isinstance(item.get("sample_profile"), dict):
         raise ValueError("record missing sample_profile; run profile_samples.py first")
@@ -147,9 +316,17 @@ def decide_evolution_action(
     score_rate = get_score_rate(item)
     diagnosis_text = _joined_diagnosis_text(item)
     stop_status = _stop_status(item)
+    decision = item.get("tree_search_decision")
+    decision = decision if isinstance(decision, dict) else {}
+    frontier_action = _clean_text(decision.get("action_type"))
 
     if stop_status in STOP_STATUSES:
         return STOP_EVOLUTION, f"evolution_state.stop_status={stop_status} indicates a terminal state."
+
+    if frontier_action in {EXPAND_CURRENT_BRANCH, FORK_FROM_ROOT, FORK_FROM_PARENT}:
+        return EVOLVE_HIGH_SCORE_OVERSCORE, (
+            f"tree_search_decision.action_type={frontier_action} requests frontier expansion."
+        )
 
     if _has_any_term(diagnosis_text, STOP_TERMS) and not worth_evolving:
         return STOP_EVOLUTION, "diagnosis says the sample is stable or should stop."
@@ -198,6 +375,7 @@ def select_record(
     result = dict(item)
     result["evolution_action"] = action
     result["evolution_action_reason"] = reason
+    result["tree_search_decision"] = decide_tree_search_action(result, action)
     return result
 
 

@@ -1,9 +1,12 @@
 import argparse
+import hashlib
 import json
 import os
 import re
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from search_state_contract import DEFAULT_BOUNDARY_AXES
 
 
 DEFAULT_FULL_SCORE_THRESHOLD = 0.99
@@ -26,6 +29,26 @@ FOCUS_STOPWORDS = {
     "什么",
     "为什么",
 }
+BOUNDARY_AXIS_KEYWORDS = (
+    ("反常线索主线切换", ("反常线索", "主线切换", "主线抓偏", "受干扰信息带偏", "盯人反推车")),
+    ("最关键缺口识别", ("漏最小关键事实", "最小关键事实", "最关键缺口", "选错最关键缺口", "独立必要条件")),
+    ("题干外补设识别", ("题外补设", "题干外", "隐藏前提", "答案写太满超题", "超题", "判据外信息")),
+    ("补强项升级判断", ("补强", "线索升级", "抓显眼点漏关键层", "双门槛", "动作层与性质层")),
+    ("结论分层", ("层级越推", "层级混淆", "近似项分层", "判据内", "判据外", "漏关键层", "子判断")),
+    ("伪闭环识别", ("泛化罗列", "套话", "事实绑定", "闭环", "格式失分")),
+)
+OPERATOR_BOUNDARY_AXIS = {
+    "O1_gap_choice": "最关键缺口识别",
+    "O2_subclaim_localization": "结论分层",
+    "O3_step_jump": "结论分层",
+    "O4_near_level_ranking": "结论分层",
+    "O5_extra_premise_detection": "题干外补设识别",
+    "O6_single_variable_counterfactual": "补强项升级判断",
+    "O7_fact_binding_constraint": "伪闭环识别",
+    "O8_double_threshold_claim": "补强项升级判断",
+    "O9_abnormal_clue_mainline_switch": "反常线索主线切换",
+}
+BOUNDARY_CANDIDATE_LABELS = {"effective_boundary_probe", "needs_manual_review"}
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -52,6 +75,10 @@ def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str) -> None:
 
 def _clean_text(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _short_hash(value: Any) -> str:
+    return hashlib.sha1(_clean_text(value).encode("utf-8")).hexdigest()[:12]
 
 
 def _coerce_score_rate(value: Any) -> Optional[float]:
@@ -102,6 +129,11 @@ def get_metadata(item: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     metadata = meta_info.get("question_evolution_metadata")
     return metadata if isinstance(metadata, dict) else {}
+
+
+def _dict_field(item: Dict[str, Any], field: str) -> Dict[str, Any]:
+    value = item.get(field)
+    return value if isinstance(value, dict) else {}
 
 
 def get_validation_result(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -179,6 +211,192 @@ def get_candidate_answer(item: Dict[str, Any]) -> str:
 
 def has_candidate_answer(item: Dict[str, Any]) -> bool:
     return bool(get_candidate_answer(item))
+
+
+def normalize_boundary_axis(value: Any) -> Optional[str]:
+    text = _clean_text(value)
+    if not text:
+        return None
+    if text in DEFAULT_BOUNDARY_AXES:
+        return text
+    for axis in DEFAULT_BOUNDARY_AXES:
+        if axis in text or text in axis:
+            return axis
+    for axis, keywords in BOUNDARY_AXIS_KEYWORDS:
+        if any(keyword in text for keyword in keywords):
+            return axis
+    return None
+
+
+def _first_normalized_axis(values: Sequence[Any]) -> Optional[str]:
+    for value in values:
+        if isinstance(value, list):
+            axis = _first_normalized_axis(value)
+        else:
+            axis = normalize_boundary_axis(value)
+        if axis:
+            return axis
+    return None
+
+
+def get_target_boundary_axis(item: Dict[str, Any]) -> Optional[str]:
+    metadata = get_metadata(item)
+    generation = _dict_field(item, "candidate_generation")
+    operator_route = _dict_field(item, "operator_route")
+    decision = _dict_field(item, "tree_search_decision")
+    state = _dict_field(item, "evolution_state")
+    profile = _dict_field(item, "sample_profile")
+    diagnosis = _dict_field(item, "overscore_diagnosis")
+
+    return _first_normalized_axis(
+        [
+            metadata.get("boundary_axis"),
+            metadata.get("target_boundary_axis"),
+            metadata.get("ability_axis"),
+            generation.get("boundary_axis"),
+            generation.get("target_boundary_axis"),
+            operator_route.get("boundary_axis"),
+            operator_route.get("target_boundary_axis"),
+            decision.get("target_boundary_axis"),
+            state.get("boundary_axis"),
+            profile.get("next_best_axes"),
+            profile.get("boundary_axis_candidates"),
+            diagnosis.get("target_failure_mode"),
+            diagnosis.get("candidate_overscore_cause"),
+        ]
+    )
+
+
+def detect_boundary_axis(
+    item: Dict[str, Any],
+    *,
+    candidate_answer: str = "",
+    expected_focus: Optional[Sequence[str]] = None,
+) -> Optional[str]:
+    metadata = get_metadata(item)
+    diagnosis = _dict_field(item, "overscore_diagnosis")
+    scoring_result = _dict_field(item, "scoring_result")
+    item_score_reasons: List[str] = []
+    item_scores = scoring_result.get("item_scores")
+    if isinstance(item_scores, list):
+        for item_score in item_scores:
+            if isinstance(item_score, dict):
+                item_score_reasons.extend(
+                    [
+                        _clean_text(item_score.get("brief_reason")),
+                        _clean_text(item_score.get("title")),
+                    ]
+                )
+
+    text_sources: List[Any] = [
+        candidate_answer,
+        item_score_reasons,
+        expected_focus or [],
+        metadata.get("expected_qwen_failure"),
+        diagnosis.get("target_failure_mode"),
+        diagnosis.get("candidate_overscore_cause"),
+        item.get("prompt"),
+    ]
+    axis = _first_normalized_axis(text_sources)
+    if axis:
+        return axis
+
+    operator_axis = OPERATOR_BOUNDARY_AXIS.get(get_operator_used(item))
+    return operator_axis or get_target_boundary_axis(item)
+
+
+def _existing_boundaries(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    state = _dict_field(item, "evolution_state")
+    discovered = state.get("discovered_boundaries")
+    if not isinstance(discovered, list):
+        return []
+    return [boundary for boundary in discovered if isinstance(boundary, dict)]
+
+
+def _boundary_signature_terms(item: Dict[str, Any]) -> List[str]:
+    metadata = get_metadata(item)
+    diagnosis = _dict_field(item, "overscore_diagnosis")
+    generation = _dict_field(item, "candidate_generation")
+    text_sources: List[str] = []
+    for value in (
+        metadata.get("expected_qwen_failure"),
+        metadata.get("expected_evaluation_focus"),
+        diagnosis.get("target_failure_mode"),
+        diagnosis.get("candidate_overscore_cause"),
+        generation.get("branch_id"),
+    ):
+        if isinstance(value, list):
+            text_sources.extend(_clean_text(value_item) for value_item in value if _clean_text(value_item))
+        else:
+            text = _clean_text(value)
+            if text:
+                text_sources.append(text)
+    terms = _focus_terms(text_sources)
+    if terms:
+        return terms[:6]
+    prompt_terms = _focus_terms([_clean_text(item.get("prompt"))])
+    return prompt_terms[:6]
+
+
+def build_boundary_dedup_signature(
+    item: Dict[str, Any],
+    boundary_axis: Optional[str] = None,
+) -> str:
+    axis = normalize_boundary_axis(boundary_axis) or get_target_boundary_axis(item) or "unknown_axis"
+    terms = _boundary_signature_terms(item)
+    if not terms:
+        terms = [_short_hash(item.get("prompt"))]
+    payload = "|||".join([record_key(item), axis, "|".join(terms)])
+    return f"boundary:{_short_hash(record_key(item))}:{_short_hash(axis)}:{_short_hash(payload)}"
+
+
+def is_duplicate_boundary_for_sample(
+    item: Dict[str, Any],
+    *,
+    boundary_axis: Optional[str],
+    dedup_signature: str,
+) -> bool:
+    axis = normalize_boundary_axis(boundary_axis)
+    for boundary in _existing_boundaries(item):
+        existing_signature = _clean_text(boundary.get("dedup_signature"))
+        if existing_signature and existing_signature == dedup_signature:
+            return True
+        existing_axis = normalize_boundary_axis(
+            boundary.get("boundary_axis_detected")
+            or boundary.get("boundary_axis")
+            or boundary.get("target_boundary_axis")
+        )
+        if axis and existing_axis == axis and not existing_signature:
+            return True
+    return False
+
+
+def boundary_candidate_status(
+    *,
+    effect_label: str,
+    complexity_passed: bool,
+    repeated: bool,
+    focus_matches: bool,
+    structural_signal: bool,
+    duplicate: bool,
+    is_new: bool,
+    boundary_axis_mismatch: bool,
+) -> str:
+    if not complexity_passed:
+        return "invalid_candidate"
+    if repeated:
+        return "duplicate_pattern"
+    if duplicate:
+        return "duplicate_boundary"
+    if is_new and boundary_axis_mismatch:
+        return "axis_mismatch_needs_review"
+    if is_new and structural_signal and effect_label not in BOUNDARY_CANDIDATE_LABELS:
+        return "structural_signal_needs_review"
+    if is_new:
+        return "new_boundary"
+    if effect_label == "needs_manual_review" or (structural_signal and focus_matches):
+        return "needs_manual_review"
+    return "not_boundary"
 
 
 def _focus_terms(texts: Sequence[str]) -> List[str]:
@@ -350,6 +568,64 @@ def build_effect_analysis(
         effect_label = "no_clear_effect"
         reason = "未观察到足够清晰的得分变化。"
 
+    target_boundary_axis = get_target_boundary_axis(item)
+    boundary_axis_detected = detect_boundary_axis(
+        item,
+        candidate_answer=candidate_answer,
+        expected_focus=focus,
+    )
+    structural_boundary_signal = (
+        evolved
+        and complexity_passed
+        and not repeated
+        and answer_present
+        and focus_matches
+    )
+    boundary_candidate = (
+        bool(boundary_axis_detected)
+        and (
+            effect_label == "effective_boundary_probe"
+            or (effect_label == "needs_manual_review" and focus_matches)
+            or structural_boundary_signal
+        )
+    )
+    dedup_signature = build_boundary_dedup_signature(
+        item,
+        boundary_axis=boundary_axis_detected or target_boundary_axis,
+    )
+    duplicate_boundary = (
+        boundary_candidate
+        and is_duplicate_boundary_for_sample(
+            item,
+            boundary_axis=boundary_axis_detected or target_boundary_axis,
+            dedup_signature=dedup_signature,
+        )
+    )
+    is_new_boundary = bool(boundary_candidate and not duplicate_boundary)
+    boundary_axis_mismatch = bool(
+        target_boundary_axis
+        and boundary_axis_detected
+        and target_boundary_axis != boundary_axis_detected
+    )
+    if boundary_axis_mismatch:
+        boundary_axis_audit_reason = (
+            f"目标能力轴为 {target_boundary_axis}，但候选答案/评分证据更像命中 {boundary_axis_detected}。"
+        )
+    elif boundary_axis_detected:
+        boundary_axis_audit_reason = "目标能力轴与检测能力轴一致，或仅检测到单一能力轴。"
+    else:
+        boundary_axis_audit_reason = "缺少足够结构化字段或文本信号，无法检测能力轴。"
+    candidate_status = boundary_candidate_status(
+        effect_label=effect_label,
+        complexity_passed=complexity_passed,
+        repeated=repeated,
+        focus_matches=focus_matches,
+        structural_signal=structural_boundary_signal,
+        duplicate=duplicate_boundary,
+        is_new=is_new_boundary,
+        boundary_axis_mismatch=boundary_axis_mismatch,
+    )
+
     return {
         "score_rate_before": score_rate_before,
         "score_rate_after": score_rate_after,
@@ -361,10 +637,23 @@ def build_effect_analysis(
         "repeated_pattern_with_previous_round": repeated,
         "lightweight_boundary_hit": lightweight_boundary_hit,
         "hit_confidence": confidence,
-        "needs_manual_review": bool(lightweight_boundary_hit) or effect_label == "needs_manual_review",
+        "needs_manual_review": (
+            bool(lightweight_boundary_hit)
+            or effect_label == "needs_manual_review"
+            or (structural_boundary_signal and effect_label != "effective_boundary_probe")
+        ),
         "focus_answer_alignment": focus_alignment,
         "lightweight_hit_reason": reason,
         "effect_label": effect_label,
+        "target_boundary_axis": target_boundary_axis,
+        "boundary_axis_detected": boundary_axis_detected,
+        "boundary_axis_mismatch": boundary_axis_mismatch,
+        "boundary_axis_audit_reason": boundary_axis_audit_reason,
+        "structural_boundary_signal": structural_boundary_signal,
+        "dedup_signature": dedup_signature,
+        "duplicate_boundary_for_sample": duplicate_boundary,
+        "is_new_boundary_for_sample": is_new_boundary,
+        "boundary_candidate_status": candidate_status,
     }
 
 

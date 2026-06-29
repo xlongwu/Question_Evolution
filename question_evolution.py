@@ -10,9 +10,19 @@ from typing import Any, Dict, List, Optional
 from prompts.operators import build_operator_prompt, get_operator_spec
 from select_evolution_candidates import (
     EVOLVE_HIGH_SCORE_OVERSCORE,
+    EXPAND_CURRENT_BRANCH,
+    FORK_FROM_PARENT,
+    FORK_FROM_ROOT,
     PASS_THROUGH_OR_SCORING_NOISE,
     RECONSTRUCT_LOW_SCORE_BOUNDARY,
     STOP_EVOLUTION,
+)
+from search_state_contract import (
+    FRONTIER_ACTION_TYPES,
+    TREE_SEARCH_CONFIG_DEFAULTS,
+    get_root_prompt,
+    normalize_search_state,
+    sample_key,
 )
 from local_api_config import get_config_list, get_config_value
 import validate_evolved_question as validation_stage
@@ -40,6 +50,26 @@ NON_EVOLUTION_ACTIONS = {
     PASS_THROUGH_OR_SCORING_NOISE,
     STOP_EVOLUTION,
 }
+FRONTIER_FIELD_NAMES = {
+    "sample_id",
+    "search_root_id",
+    "frontier_node_id",
+    "source_node_id",
+    "source_node_type",
+    "source_prompt",
+    "prompt_source",
+    "action_type",
+    "branch_id",
+    "target_boundary_axis",
+    "search_depth",
+    "next_depth",
+    "max_search_depth",
+    "branch_budget_remaining",
+    "sample_budget_remaining",
+    "discovered_boundary_count",
+}
+FRONTIER_CONTEXT_KEYS = ("_frontier_context", "frontier_context", "active_frontier")
+SOURCE_NODE_TYPES = {"current", "root", "parent"}
 
 
 logging.basicConfig(
@@ -533,10 +563,145 @@ def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
     return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
+def clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def coerce_non_negative_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return parsed if parsed >= 0 else default
+
+
+def short_hash(value: Any) -> str:
+    return hashlib.sha1(str(value or "").encode("utf-8")).hexdigest()[:8]
+
+
+def safe_id_segment(value: Any, fallback: str = "node") -> str:
+    text = clean_text(value).lower()
+    text = re.sub(r"[^0-9a-zA-Z_-]+", "_", text).strip("_")
+    return text[:48] or fallback
+
+
+def get_frontier_key_suffix(item: Dict[str, Any]) -> str:
+    for container_name in FRONTIER_CONTEXT_KEYS:
+        container = item.get(container_name)
+        if isinstance(container, dict):
+            frontier_node_id = clean_text(container.get("frontier_node_id"))
+            if frontier_node_id:
+                return frontier_node_id
+
+    candidate_generation = item.get("candidate_generation")
+    if isinstance(candidate_generation, dict):
+        frontier_node_id = clean_text(candidate_generation.get("frontier_node_id"))
+        if frontier_node_id:
+            return frontier_node_id
+
+    meta_info = item.get("meta_info")
+    if isinstance(meta_info, dict):
+        metadata = meta_info.get("question_evolution_metadata")
+        if isinstance(metadata, dict):
+            frontier_node_id = clean_text(metadata.get("frontier_node_id"))
+            if frontier_node_id:
+                return frontier_node_id
+
+    frontier_node_id = clean_text(item.get("frontier_node_id"))
+    if frontier_node_id:
+        return frontier_node_id
+
+    source_node_id = clean_text(item.get("source_node_id"))
+    action_type = clean_text(item.get("action_type"))
+    target_axis = clean_text(item.get("target_boundary_axis"))
+    if source_node_id or action_type or target_axis:
+        return f"{source_node_id}|{action_type}|{target_axis}"
+    return ""
+
+
 def get_item_key(item: Dict[str, Any]) -> str:
     index = item.get("index", "")
     prompt = item.get("prompt", "")
+    frontier_suffix = get_frontier_key_suffix(item)
+    if frontier_suffix:
+        return f"{index}|||{prompt}|||frontier:{frontier_suffix}"
     return f"{index}|||{prompt}"
+
+
+def record_lookup_keys(record: Dict[str, Any]) -> List[str]:
+    keys = []
+    for field in ("sample_id", "index"):
+        value = clean_text(record.get(field))
+        if value:
+            keys.append(value)
+    try:
+        state = normalize_search_state(record)
+        root_id = clean_text(state.get("search_root_id"))
+        if root_id:
+            keys.append(root_id)
+    except Exception:
+        root_id = clean_text(record.get("search_root_id"))
+        if root_id:
+            keys.append(root_id)
+    return list(dict.fromkeys(keys))
+
+
+def expand_items_from_frontier(
+    base_items: List[Dict[str, Any]],
+    frontier_items: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    base_by_key: Dict[str, Dict[str, Any]] = {}
+    for item in base_items:
+        for key in record_lookup_keys(item):
+            base_by_key.setdefault(key, item)
+
+    expanded: List[Dict[str, Any]] = []
+    for frontier in frontier_items:
+        lookup_candidates = [
+            clean_text(frontier.get("sample_id")),
+            clean_text(frontier.get("index")),
+            clean_text(frontier.get("search_root_id")),
+        ]
+        base_item = None
+        for key in lookup_candidates:
+            if key and key in base_by_key:
+                base_item = base_by_key[key]
+                break
+        if base_item is None:
+            raise ValueError(
+                "frontier row 无法在 --input 中找到匹配的基础记录: "
+                f"frontier_node_id={frontier.get('frontier_node_id')}"
+            )
+
+        item = dict(base_item)
+        item["_frontier_context"] = dict(frontier)
+
+        decision = item.get("tree_search_decision")
+        decision = dict(decision) if isinstance(decision, dict) else {}
+        if clean_text(frontier.get("action_type")):
+            decision["action_type"] = clean_text(frontier.get("action_type"))
+            decision["branch_intent"] = clean_text(frontier.get("action_type"))
+        if clean_text(frontier.get("source_node_type")):
+            decision["source_node_type"] = clean_text(frontier.get("source_node_type"))
+        if clean_text(frontier.get("target_boundary_axis")):
+            decision["target_boundary_axis"] = clean_text(frontier.get("target_boundary_axis"))
+        item["tree_search_decision"] = decision
+
+        route = item.get("operator_route")
+        if isinstance(route, dict):
+            route = dict(route)
+            if clean_text(frontier.get("action_type")):
+                route["branch_action"] = clean_text(frontier.get("action_type"))
+                route["branch_intent"] = clean_text(frontier.get("action_type"))
+            if clean_text(frontier.get("source_node_type")):
+                route["source_node_type"] = clean_text(frontier.get("source_node_type"))
+            if clean_text(frontier.get("target_boundary_axis")):
+                route["target_boundary_axis"] = clean_text(frontier.get("target_boundary_axis"))
+                route["boundary_axis"] = clean_text(frontier.get("target_boundary_axis"))
+            item["operator_route"] = route
+
+        expanded.append(item)
+    return expanded
 
 
 def load_processed_keys(output_path: str) -> set:
@@ -628,6 +793,252 @@ def get_overscore_diagnosis(item: Dict[str, Any]) -> Dict[str, Any]:
     return diagnosis if isinstance(diagnosis, dict) else {}
 
 
+def get_tree_search_decision(item: Dict[str, Any]) -> Dict[str, Any]:
+    decision = item.get("tree_search_decision")
+    return decision if isinstance(decision, dict) else {}
+
+
+def collect_frontier_context(item: Dict[str, Any]) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    for container_name in FRONTIER_CONTEXT_KEYS:
+        container = item.get(container_name)
+        if isinstance(container, dict):
+            context.update(container)
+    for field in FRONTIER_FIELD_NAMES:
+        if field in item:
+            context[field] = item[field]
+    return context
+
+
+def infer_source_node_type(action_type: str) -> str:
+    if action_type == FORK_FROM_ROOT:
+        return "root"
+    if action_type == FORK_FROM_PARENT:
+        return "parent"
+    return "current"
+
+
+def get_parent_prompt(item: Dict[str, Any]) -> str:
+    meta_info = item.get("meta_info")
+    if isinstance(meta_info, dict):
+        for field in ("parent_prompt", "source_parent_prompt", "prompt_parent"):
+            value = clean_text(meta_info.get(field))
+            if value:
+                return value
+    return get_root_prompt(item)
+
+
+def get_generation_context(item: Dict[str, Any]) -> Dict[str, Any]:
+    state = normalize_search_state(item)
+    route = get_operator_route(item)
+    decision = get_tree_search_decision(item)
+    frontier = collect_frontier_context(item)
+
+    action_type = (
+        clean_text(frontier.get("action_type"))
+        or clean_text(route.get("branch_action"))
+        or clean_text(decision.get("action_type"))
+        or clean_text(route.get("branch_intent"))
+        or clean_text(decision.get("branch_intent"))
+        or EXPAND_CURRENT_BRANCH
+    )
+    if action_type not in FRONTIER_ACTION_TYPES:
+        action_type = EXPAND_CURRENT_BRANCH
+
+    source_node_type = (
+        clean_text(frontier.get("source_node_type"))
+        or clean_text(route.get("source_node_type"))
+        or clean_text(decision.get("source_node_type"))
+        or infer_source_node_type(action_type)
+    )
+    if source_node_type not in SOURCE_NODE_TYPES:
+        source_node_type = infer_source_node_type(action_type)
+
+    source_prompt = clean_text(frontier.get("source_prompt"))
+    prompt_source = clean_text(frontier.get("prompt_source"))
+    if not source_prompt:
+        if source_node_type == "root":
+            source_prompt = get_root_prompt(item)
+            prompt_source = prompt_source or (
+                "meta_info.prompt_old" if source_prompt != clean_text(item.get("prompt")) else "prompt"
+            )
+        elif source_node_type == "parent":
+            source_prompt = get_parent_prompt(item)
+            prompt_source = prompt_source or "parent_node"
+        else:
+            source_prompt = clean_text(item.get("prompt"))
+            prompt_source = prompt_source or "prompt"
+
+    if not source_prompt:
+        raise ValueError("缺少有效 source prompt，无法执行回溯式候选生成")
+
+    search_root_id = clean_text(frontier.get("search_root_id")) or clean_text(state.get("search_root_id"))
+    if source_node_type == "root":
+        source_node_id = clean_text(frontier.get("source_node_id")) or search_root_id
+        default_next_depth = 1
+    elif source_node_type == "parent":
+        source_node_id = (
+            clean_text(frontier.get("source_node_id"))
+            or clean_text(state.get("parent_node_id"))
+            or search_root_id
+        )
+        default_next_depth = max(1, coerce_non_negative_int(state.get("search_depth"), 0))
+    else:
+        source_node_id = (
+            clean_text(frontier.get("source_node_id"))
+            or clean_text(state.get("current_node_id"))
+            or search_root_id
+        )
+        default_next_depth = coerce_non_negative_int(state.get("search_depth"), 0) + 1
+
+    explicit_branch_id = bool(clean_text(frontier.get("branch_id")))
+    branch_id = clean_text(frontier.get("branch_id")) or clean_text(state.get("branch_id")) or "main"
+    target_boundary_axis = (
+        clean_text(frontier.get("target_boundary_axis"))
+        or clean_text(route.get("target_boundary_axis"))
+        or clean_text(route.get("boundary_axis"))
+        or clean_text(decision.get("target_boundary_axis"))
+        or clean_text(state.get("boundary_axis"))
+    )
+
+    search_depth = coerce_non_negative_int(frontier.get("search_depth"), coerce_non_negative_int(state.get("search_depth"), 0))
+    next_depth = coerce_non_negative_int(frontier.get("next_depth"), default_next_depth)
+    max_search_depth = coerce_non_negative_int(
+        frontier.get("max_search_depth"),
+        coerce_non_negative_int(state.get("max_search_depth"), int(TREE_SEARCH_CONFIG_DEFAULTS["MAX_SAMPLE_DEPTH"])),
+    )
+    branch_budget_remaining = coerce_non_negative_int(
+        frontier.get("branch_budget_remaining"),
+        coerce_non_negative_int(
+            state.get("branch_budget_remaining"),
+            max(0, max_search_depth - search_depth),
+        ),
+    )
+    sample_budget_remaining = coerce_non_negative_int(
+        frontier.get("sample_budget_remaining"),
+        coerce_non_negative_int(
+            state.get("sample_budget_remaining"),
+            int(TREE_SEARCH_CONFIG_DEFAULTS["MAX_SAMPLE_CANDIDATES_TOTAL"]),
+        ),
+    )
+    discovered_boundary_count = coerce_non_negative_int(
+        frontier.get("discovered_boundary_count"),
+        len(state.get("discovered_boundaries") or []),
+    )
+
+    return {
+        "sample_id": clean_text(frontier.get("sample_id")) or sample_key(item),
+        "search_root_id": search_root_id,
+        "frontier_node_id": clean_text(frontier.get("frontier_node_id"))
+        or f"frontier_{safe_id_segment(source_node_id)}_{safe_id_segment(action_type)}",
+        "source_node_id": source_node_id,
+        "source_node_type": source_node_type,
+        "source_prompt": source_prompt,
+        "prompt_source": prompt_source or "prompt",
+        "action_type": action_type,
+        "branch_id": branch_id,
+        "target_boundary_axis": target_boundary_axis,
+        "search_depth": search_depth,
+        "next_depth": next_depth,
+        "max_search_depth": max_search_depth,
+        "branch_budget_remaining": branch_budget_remaining,
+        "sample_budget_remaining": sample_budget_remaining,
+        "discovered_boundary_count": discovered_boundary_count,
+        "explicit_branch_id": explicit_branch_id,
+    }
+
+
+def action_starts_new_branch(action_type: str) -> bool:
+    return action_type in {FORK_FROM_ROOT, FORK_FROM_PARENT}
+
+
+def resolve_candidate_branch_id(
+    generation_context: Dict[str, Any],
+    *,
+    candidate_index: int,
+    operator_id: Optional[str],
+) -> str:
+    branch_id = clean_text(generation_context.get("branch_id")) or "main"
+    action_type = clean_text(generation_context.get("action_type"))
+    if action_starts_new_branch(action_type) and not generation_context.get("explicit_branch_id"):
+        axis = clean_text(generation_context.get("target_boundary_axis")) or operator_id or action_type
+        suffix = short_hash(
+            f"{generation_context.get('search_root_id')}|{generation_context.get('source_node_id')}|"
+            f"{action_type}|{axis}|{candidate_index}|{operator_id}"
+        )
+        return f"branch_{safe_id_segment(axis, 'axis')}_{suffix}_{candidate_index:02d}"
+    return branch_id
+
+
+def resolve_generated_node_id(
+    generation_context: Dict[str, Any],
+    *,
+    branch_id: str,
+    candidate_index: int,
+    operator_id: Optional[str],
+) -> str:
+    root_id = safe_id_segment(generation_context.get("search_root_id"), "sample")
+    branch_segment = safe_id_segment(branch_id, "branch")
+    depth = coerce_non_negative_int(generation_context.get("next_depth"), 0)
+    suffix = short_hash(
+        f"{generation_context.get('source_node_id')}|{branch_id}|{depth}|{candidate_index}|{operator_id}"
+    )
+    return f"{root_id}_{branch_segment}_d{depth}_c{candidate_index}_{suffix}"
+
+
+def build_generation_metadata(
+    generation_context: Dict[str, Any],
+    *,
+    candidate_index: int,
+    operator_id: Optional[str],
+) -> Dict[str, Any]:
+    branch_id = resolve_candidate_branch_id(
+        generation_context,
+        candidate_index=candidate_index,
+        operator_id=operator_id,
+    )
+    node_id = resolve_generated_node_id(
+        generation_context,
+        branch_id=branch_id,
+        candidate_index=candidate_index,
+        operator_id=operator_id,
+    )
+    action_type = clean_text(generation_context.get("action_type"))
+    is_new_branch = action_starts_new_branch(action_type)
+    parent_node_id = clean_text(generation_context.get("source_node_id"))
+    return {
+        "search_root_id": clean_text(generation_context.get("search_root_id")),
+        "frontier_node_id": clean_text(generation_context.get("frontier_node_id")),
+        "source_node_id": parent_node_id,
+        "source_node_type": clean_text(generation_context.get("source_node_type")),
+        "source_prompt": clean_text(generation_context.get("source_prompt")),
+        "prompt_source": clean_text(generation_context.get("prompt_source")),
+        "parent_node_id": parent_node_id,
+        "generated_node_id": node_id,
+        "branch_id": branch_id,
+        "boundary_axis": clean_text(generation_context.get("target_boundary_axis")) or None,
+        "is_new_branch": is_new_branch,
+        "operator_used": operator_id,
+        "search_depth": coerce_non_negative_int(generation_context.get("next_depth"), 0),
+        "generation_action": action_type,
+        "branch_budget_remaining": coerce_non_negative_int(generation_context.get("branch_budget_remaining"), 0),
+        "sample_budget_remaining": coerce_non_negative_int(generation_context.get("sample_budget_remaining"), 0),
+    }
+
+
+def candidate_budget_cap(item: Dict[str, Any], requested_max: int) -> int:
+    if not should_evolve(item, 0):
+        return 1
+    context = get_generation_context(item)
+    caps = [
+        requested_max,
+        int(TREE_SEARCH_CONFIG_DEFAULTS["MAX_SAMPLE_BRANCHES"]),
+        coerce_non_negative_int(context.get("branch_budget_remaining"), requested_max),
+        coerce_non_negative_int(context.get("sample_budget_remaining"), requested_max),
+    ]
+    return max(0, min(caps))
+
+
 def resolve_operator_id(item: Dict[str, Any]) -> str:
     action = get_evolution_action(item)
     if action not in EVOLUTION_REQUIRED_ACTIONS:
@@ -646,13 +1057,15 @@ def resolve_operator_id(item: Dict[str, Any]) -> str:
 
 
 def get_candidate_group_id(item: Dict[str, Any]) -> str:
+    frontier_suffix = get_frontier_key_suffix(item)
+    suffix = f"::{safe_id_segment(frontier_suffix, 'frontier')}" if frontier_suffix else ""
     for field in ("sample_id", "index"):
         value = item.get(field)
         if value is not None and str(value).strip():
-            return str(value).strip()
+            return f"{str(value).strip()}{suffix}"
     prompt = str(item.get("prompt", "") or "")
     digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
-    return f"prompt_{digest}"
+    return f"prompt_{digest}{suffix}"
 
 
 def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) -> List[str]:
@@ -775,12 +1188,26 @@ def build_evolution_prompt(
     operator_id: Optional[str] = None,
     validation_reject_reason: Optional[str] = None,
 ) -> str:
-    prompt = item.get("prompt")
+    generation_context = get_generation_context(item)
+    prompt = generation_context["source_prompt"]
     rubric = item.get("rubric")
     if not isinstance(prompt, str) or not prompt.strip():
-        raise ValueError("缺少有效 prompt")
+        raise ValueError("缺少有效 source prompt")
 
     if operator_id:
+        evolution_state = dict(get_evolution_state(item))
+        evolution_state.update(
+            {
+                "search_root_id": generation_context["search_root_id"],
+                "current_node_id": generation_context["source_node_id"],
+                "branch_id": generation_context["branch_id"],
+                "boundary_axis": generation_context["target_boundary_axis"],
+                "search_depth": generation_context["search_depth"],
+                "next_search_depth": generation_context["next_depth"],
+                "generation_action": generation_context["action_type"],
+                "source_node_type": generation_context["source_node_type"],
+            }
+        )
         user_prompt = build_operator_prompt(
             operator_id,
             prompt=prompt.strip(),
@@ -789,7 +1216,7 @@ def build_evolution_prompt(
             rubric=rubric if isinstance(rubric, list) else [],
             sample_profile=get_sample_profile(item),
             overscore_diagnosis=get_overscore_diagnosis(item),
-            evolution_state=get_evolution_state(item),
+            evolution_state=evolution_state,
             operator_route=get_operator_route(item),
         )
         return append_validation_retry_instruction(user_prompt, validation_reject_reason)
@@ -808,7 +1235,8 @@ def build_evolution_prompt(
 
 def build_validation_probe_record(item: Dict[str, Any], evolved: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(item)
-    original_prompt = str(item.get("prompt", "") or "").strip()
+    generation_context = get_generation_context(item)
+    original_prompt = generation_context["source_prompt"]
     result["prompt"] = str(evolved.get("evolved_prompt", "") or "").strip()
     result["question_evolved"] = True
 
@@ -876,10 +1304,26 @@ def enrich_evolution_result_with_operator(
     return enriched
 
 
-def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rate: Optional[float], model: str) -> Dict[str, Any]:
+def make_evolved_record(
+    item: Dict[str, Any],
+    evolved: Dict[str, Any],
+    score_rate: Optional[float],
+    model: str,
+    *,
+    generation_context: Optional[Dict[str, Any]] = None,
+    candidate_index: int = 1,
+    operator_id: Optional[str] = None,
+) -> Dict[str, Any]:
     """构造进化后的记录。注意：rubric/score_prompt/scoring_result 对已改变 prompt 的题目已失效，移到 meta_info 中保存。"""
     result = dict(item)
-    original_prompt = str(item.get("prompt", "")).strip()
+    result.pop("_frontier_context", None)
+    generation_context = generation_context or get_generation_context(item)
+    generation_metadata = build_generation_metadata(
+        generation_context,
+        candidate_index=candidate_index,
+        operator_id=operator_id or evolved.get("operator_used"),
+    )
+    original_prompt = generation_context["source_prompt"]
     evolved_prompt = evolved["evolved_prompt"]
 
     # 保留旧 prompt 与旧评分产物
@@ -919,6 +1363,25 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
         if isinstance(value, str) and value.strip():
             metadata[field] = value.strip()
 
+    for field in (
+        "search_root_id",
+        "frontier_node_id",
+        "source_node_id",
+        "source_node_type",
+        "parent_node_id",
+        "generated_node_id",
+        "branch_id",
+        "boundary_axis",
+        "prompt_source",
+        "source_prompt",
+        "generation_action",
+        "search_depth",
+        "is_new_branch",
+    ):
+        value = generation_metadata.get(field)
+        if value is not None and value != "":
+            metadata[field] = value
+
     complexity_budget = evolved.get("complexity_budget")
     if isinstance(complexity_budget, dict):
         metadata["complexity_budget"] = complexity_budget
@@ -929,8 +1392,26 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
 
     meta_info["question_evolution_metadata"] = metadata
 
+    state = get_evolution_state(result)
+    state = dict(state) if isinstance(state, dict) else {}
+    state.update(
+        {
+            "search_root_id": generation_metadata["search_root_id"],
+            "current_node_id": generation_metadata["generated_node_id"],
+            "parent_node_id": generation_metadata["parent_node_id"],
+            "branch_id": generation_metadata["branch_id"],
+            "boundary_axis": generation_metadata["boundary_axis"],
+            "branch_status": "exploring",
+            "search_depth": generation_metadata["search_depth"],
+            "max_search_depth": generation_context["max_search_depth"],
+            "branch_budget_remaining": generation_context["branch_budget_remaining"],
+            "sample_budget_remaining": generation_context["sample_budget_remaining"],
+        }
+    )
+
     result["prompt"] = evolved_prompt
     result["meta_info"] = meta_info
+    result["evolution_state"] = state
     result["question_evolved"] = True
     return result
 
@@ -945,8 +1426,18 @@ def make_evolved_candidate_record(
     requested_candidates: int,
     operator_id: Optional[str],
 ) -> Dict[str, Any]:
-    result = make_evolved_record(item, evolved, score_rate, model)
+    generation_context = get_generation_context(item)
+    result = make_evolved_record(
+        item,
+        evolved,
+        score_rate,
+        model,
+        generation_context=generation_context,
+        candidate_index=candidate_index,
+        operator_id=operator_id,
+    )
     group_id = get_candidate_group_id(item)
+    metadata = result["meta_info"]["question_evolution_metadata"]
     result["candidate_group_id"] = group_id
     result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
     result["candidate_operator"] = operator_id or evolved.get("operator_used")
@@ -955,6 +1446,18 @@ def make_evolved_candidate_record(
         "num_candidates_requested": requested_candidates,
         "operator_id": operator_id,
         "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
+        "search_root_id": metadata.get("search_root_id"),
+        "frontier_node_id": metadata.get("frontier_node_id"),
+        "source_node_id": metadata.get("source_node_id"),
+        "source_node_type": metadata.get("source_node_type"),
+        "parent_node_id": metadata.get("parent_node_id"),
+        "generated_node_id": metadata.get("generated_node_id"),
+        "branch_id": metadata.get("branch_id"),
+        "boundary_axis": metadata.get("boundary_axis"),
+        "is_new_branch": metadata.get("is_new_branch"),
+        "search_depth": metadata.get("search_depth"),
+        "generation_action": metadata.get("generation_action"),
+        "prompt_source": metadata.get("prompt_source"),
     }
     return result
 
@@ -1083,7 +1586,7 @@ class QuestionEvolutionProcessor:
 
     async def process_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         async with self.semaphore:
-            if not should_evolve(item, self.min_score_rate):
+            if not should_evolve(item, self.min_score_rate) or candidate_budget_cap(item, 1) < 1:
                 # 未触发进化，原样输出，仅加标记
                 return make_passthrough_record(item)
 
@@ -1098,7 +1601,8 @@ class QuestionEvolutionProcessor:
     ) -> List[Dict[str, Any]]:
         async with self.semaphore:
             candidate_count = requested_candidates or self.num_candidates
-            if not should_evolve(item, self.min_score_rate):
+            candidate_count = candidate_budget_cap(item, candidate_count)
+            if not should_evolve(item, self.min_score_rate) or candidate_count < 1:
                 return [make_passthrough_candidate_record(item, candidate_count)]
 
             score_rate = get_score_rate(item)
@@ -1156,7 +1660,7 @@ class QuestionEvolutionProcessor:
         if invalid_count >= 2 or previous_effect in {"invalid_complexity", "no_clear_effect"}:
             count = max(count, 3)
 
-        return max(1, min(self.num_candidates, count))
+        return max(1, candidate_budget_cap(item, min(self.num_candidates, count)))
 
     def allocate_candidate_counts(self, items: List[Dict[str, Any]]) -> Dict[str, int]:
         target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
@@ -1188,11 +1692,24 @@ class QuestionEvolutionProcessor:
                 break
         return counts
 
-    async def process_file(self, input_path: str, output_path: str):
+    async def process_file(
+        self,
+        input_path: str,
+        output_path: str,
+        frontier_input_path: Optional[str] = None,
+    ):
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"输入文件不存在: {input_path}")
 
         items = load_json_or_jsonl(input_path)
+        if frontier_input_path:
+            if not os.path.exists(frontier_input_path):
+                raise FileNotFoundError(f"frontier 输入文件不存在: {frontier_input_path}")
+            frontier_items = load_json_or_jsonl(frontier_input_path)
+            items = expand_items_from_frontier(items, frontier_items)
+            logger.info(
+                f"读取到 {len(frontier_items)} 条 frontier 记录，展开为 {len(items)} 条待生成记录"
+            )
         target_items = [item for item in items if should_evolve(item, self.min_score_rate)]
         logger.info(
             f"读取到 {len(items)} 条记录，其中需要 question evolution 的记录 {len(target_items)} 条"
@@ -1294,6 +1811,12 @@ async def main():
         help="单轮待进化样本的候选总预算；<=0 时默认为待进化样本数 * 2"
     )
     parser.add_argument(
+        "--frontier-input",
+        type=str,
+        default=None,
+        help="可选 active_frontier.jsonl；提供时会按 sample_id/search_root_id 叠加到 --input 基础记录上生成候选"
+    )
+    parser.add_argument(
         "--validation-retries",
         type=int,
         default=DEFAULT_MAX_VALIDATION_RETRIES,
@@ -1332,7 +1855,7 @@ async def main():
     )
 
     try:
-        await processor.process_file(args.input, args.output)
+        await processor.process_file(args.input, args.output, frontier_input_path=args.frontier_input)
     finally:
         await client.close()
 

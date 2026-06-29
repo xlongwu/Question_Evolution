@@ -19,6 +19,52 @@
     "operator_used": {
       "type": "string"
     },
+    "search_root_id": {
+      "type": "string"
+    },
+    "frontier_node_id": {
+      "type": "string"
+    },
+    "source_node_id": {
+      "type": "string"
+    },
+    "source_node_type": {
+      "enum": ["current", "root", "parent"]
+    },
+    "parent_node_id": {
+      "type": "string"
+    },
+    "generated_node_id": {
+      "type": "string"
+    },
+    "branch_id": {
+      "type": "string"
+    },
+    "boundary_axis": {
+      "type": ["string", "null"]
+    },
+    "is_new_branch": {
+      "type": "boolean"
+    },
+    "generation_action": {
+      "enum": [
+        "expand_current_branch",
+        "fork_from_root",
+        "fork_from_parent",
+        "stop_branch",
+        "stop_sample"
+      ]
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prompt_source": {
+      "type": "string"
+    },
+    "source_prompt": {
+      "type": "string"
+    },
     "ability_axis": {
       "type": "string"
     },

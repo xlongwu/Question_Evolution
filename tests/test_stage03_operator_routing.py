@@ -68,16 +68,45 @@ def test_router_covers_representative_stage03_paths():
 
     assert routes["stage03-o1"]["primary_operator"] == "O1_gap_choice"
     assert "O2_subclaim_localization" in routes["stage03-o1"]["backup_operators"]
+    assert routes["stage03-o1"]["target_boundary_axis"] == "最关键缺口识别"
+    assert routes["stage03-o1"]["branch_intent"] == "expand_current_branch"
+    assert routes["stage03-o1"]["source_node_type"] == "current"
 
     assert routes["stage03-o2"]["primary_operator"] == "O2_subclaim_localization"
     assert "O1_gap_choice" in routes["stage03-o2"]["avoid_operators"]
     assert "O4_near_level_ranking" in routes["stage03-o2"]["backup_operators"]
+    assert routes["stage03-o2"]["target_boundary_axis"] == "最关键缺口识别"
 
     assert routes["stage03-o4"]["primary_operator"] == "O4_near_level_ranking"
+    assert routes["stage03-o4"]["target_boundary_axis"] == "结论分层"
     assert routes["stage03-o8"]["primary_operator"] == "O8_double_threshold_claim"
+    assert routes["stage03-o8"]["target_boundary_axis"] == "补强项升级判断"
     assert routes["stage03-o9"]["primary_operator"] == "O9_abnormal_clue_mainline_switch"
+    assert routes["stage03-o9"]["target_boundary_axis"] == "反常线索主线切换"
 
     assert routes["stage03-pass"]["primary_operator"] is None
+    assert routes["stage03-pass"]["branch_action"] == "stop_branch"
+    assert routes["stage03-pass"]["stop_reason"] == "pass_through_or_scoring_noise"
+
+
+def test_router_consumes_tree_search_decision_for_root_fork():
+    record = load_jsonl(ROOT / "tests" / "fixtures" / "stage03_routing_input.jsonl")[0]
+    record["tree_search_decision"] = {
+        "action_type": "fork_from_root",
+        "branch_intent": "fork_from_root",
+        "source_node_type": "root",
+        "target_boundary_axis": "题干外补设识别",
+        "reason": "open a root branch for an unexplored axis",
+    }
+
+    routed = route_records([record])[0]
+    route = routed["operator_route"]
+
+    assert route["branch_action"] == "fork_from_root"
+    assert route["source_node_type"] == "root"
+    assert route["target_boundary_axis"] == "题干外补设识别"
+    assert route["primary_operator"] == "O5_extra_premise_detection"
+    assert route["should_use_local_tree_search"] is True
 
 
 def test_question_evolution_uses_route_and_skips_passthrough():
@@ -110,5 +139,6 @@ def test_question_evolution_uses_route_and_skips_passthrough():
 if __name__ == "__main__":
     test_operator_registry_covers_o1_to_o9()
     test_router_covers_representative_stage03_paths()
+    test_router_consumes_tree_search_decision_for_root_fork()
     test_question_evolution_uses_route_and_skips_passthrough()
     print("stage03 operator routing checks passed")

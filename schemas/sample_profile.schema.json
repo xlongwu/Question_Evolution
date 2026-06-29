@@ -37,6 +37,24 @@
     },
     "complexity_expansion_risk": {
       "enum": ["low", "medium", "high"]
+    },
+    "boundary_axis_candidates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "already_explored_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "next_best_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
     }
   }
 }
