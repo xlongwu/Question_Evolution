@@ -9,33 +9,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-from check_runtime_environment import REQUIRED_SEED_IDS, build_report
+from check_runtime_environment import build_report
 
 
-def write_seed(path: Path) -> None:
+def write_input_data(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        "".join(
-            json.dumps(
-                {
-                    "sample_id": sample_id,
-                    "index": int(sample_id),
-                    "prompt": f"sample {sample_id}",
-                    "meta_info": {"references": ["reference"]},
-                    "rubric": [{"title": "core", "description": "core", "weight": 10}],
-                    "score_prompt": "Score <<<待评答案>>",
-                },
-                ensure_ascii=False,
-            )
-            + "\n"
-            for sample_id in sorted(REQUIRED_SEED_IDS)
-        ),
+        json.dumps(
+            {
+                "sample_id": "local-data-001",
+                "index": 1,
+                "prompt": "sample",
+                "meta_info": {"references": ["reference"]},
+                "rubric": [{"title": "core", "description": "core", "weight": 10}],
+                "score_prompt": "Score <<<answer>>>",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
         encoding="utf-8",
     )
 
 
 def test_runtime_preflight_reports_ready_when_required_inputs_exist(tmp_path):
-    seed = tmp_path / "admitted_seed_samples.jsonl"
-    write_seed(seed)
+    write_input_data(tmp_path / "data" / "data.jsonl")
     env = {
         "OPENAI_API_KEY": "test-openai-key",
         "QWEN_BASE_URL": "http://127.0.0.1:18011/v1",
@@ -45,25 +42,24 @@ def test_runtime_preflight_reports_ready_when_required_inputs_exist(tmp_path):
     report = build_report(tmp_path, env=env, bash_path="/bin/bash")
 
     assert report["checks"]["bash_available"] is True
-    assert report["checks"]["admitted_seed_ready"] is True
+    assert report["checks"]["input_data_ready"] is True
     assert report["checks"]["api_config_ready"] is True
 
 
 def test_runtime_preflight_exposes_missing_bash_and_api(tmp_path):
-    seed = tmp_path / "admitted_seed_samples.jsonl"
-    write_seed(seed)
+    write_input_data(tmp_path / "data" / "data.jsonl")
 
     report = build_report(tmp_path, env={}, bash_path="")
 
     assert report["ready_for_real_stage06_e2e"] is False
     assert report["checks"]["bash_available"] is False
     assert report["checks"]["api_config_ready"] is False
-    assert report["admitted_seed"]["required_ids_present"] is True
+    assert report["input_data"]["row_count"] == 1
+    assert report["input_data"]["jsonl_parseable"] is True
 
 
 def test_runtime_preflight_accepts_ignored_local_config(tmp_path):
-    seed = tmp_path / "admitted_seed_samples.jsonl"
-    write_seed(seed)
+    write_input_data(tmp_path / "data" / "data.jsonl")
     (tmp_path / "config.py").write_text(
         "\n".join(
             [

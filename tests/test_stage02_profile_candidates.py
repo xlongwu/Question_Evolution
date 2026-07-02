@@ -128,7 +128,80 @@ def test_profile_processor_and_selector_cover_stage02_actions():
         assert "operator_used" not in record
 
 
+def test_scheduled_tree_frontier_bypasses_profile_stop_terms():
+    record = {
+        "sample_id": "stage02-tree-frontier",
+        "prompt": "上一轮已经调度为继续扩展的树搜索节点。",
+        "score_rate": 0.84,
+        "branch_action": "expand_current_branch",
+        "source_node_id": "sample_stage02_tree_frontier_root_b1_d1",
+        "target_search_depth": 2,
+        "search_depth": 1,
+        "sample_profile": {
+            "core_capability": "证据链补强",
+            "claim_level": "可疑线索",
+            "problem_shape": "候选项区分",
+            "reasoning_granularity": "两步链条",
+            "answer_mode_expected": "比较型",
+            "easy_judgment_risk": "low",
+            "external_knowledge_risk": "low",
+            "complexity_expansion_risk": "medium",
+        },
+        "overscore_diagnosis": {
+            "is_worth_evolving": False,
+            "candidate_overscore_cause": "基础边界判断过稳",
+            "target_failure_mode": "稳定满分",
+            "why_high_score_is_suspicious": "diagnosis says the sample is stable or should stop.",
+        },
+        "evolution_state": {
+            "search_root_id": "sample_stage02_tree_frontier_root",
+            "current_node_id": "sample_stage02_tree_frontier_root_b1_d1",
+            "branch_action": "expand_current_branch",
+            "sample_stop_status": "continue_branch_search",
+            "search_depth": 1,
+            "target_search_depth": 2,
+            "branch_budget_remaining": 1,
+            "sample_budget_remaining": 3,
+            "stop_status": "validated_high_score_sample",
+        },
+    }
+
+    selected = process_records([record], high_score_threshold=0.8, low_score_threshold=0.6)
+
+    assert selected[0]["evolution_action"] == EVOLVE_HIGH_SCORE_OVERSCORE
+    assert "tree-search frontier" in selected[0]["evolution_action_reason"]
+
+    fork_record = dict(record)
+    fork_record.update(
+        {
+            "branch_action": "fork_from_root",
+            "source_node_id": "sample_stage02_tree_frontier_root",
+            "source_search_depth": 0,
+            "search_depth": 0,
+            "target_search_depth": 1,
+        }
+    )
+    fork_state = dict(record["evolution_state"])
+    fork_state.update(
+        {
+            "branch_action": "fork_from_root",
+            "current_node_id": "sample_stage02_tree_frontier_root",
+            "source_search_depth": 0,
+            "search_depth": 0,
+            "target_search_depth": 1,
+            "branch_budget_remaining": 0,
+            "max_search_depth": 2,
+        }
+    )
+    fork_record["evolution_state"] = fork_state
+
+    fork_selected = process_records([fork_record], high_score_threshold=0.8, low_score_threshold=0.6)
+
+    assert fork_selected[0]["evolution_action"] == EVOLVE_HIGH_SCORE_OVERSCORE
+
+
 if __name__ == "__main__":
     test_profile_parser_rejects_operator_recommendation()
     test_profile_processor_and_selector_cover_stage02_actions()
+    test_scheduled_tree_frontier_bypasses_profile_stop_terms()
     print("stage02 profile and candidate selection checks passed")

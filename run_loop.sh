@@ -6,6 +6,19 @@
 
 set -euo pipefail
 
+config_value() {
+    local default_value="$1"
+    shift
+    python - "$default_value" "$@" <<'PY'
+import sys
+from local_api_config import get_config_value
+
+default = sys.argv[1]
+names = sys.argv[2:]
+print(get_config_value(*names, default=default))
+PY
+}
+
 # ===================== 可配置参数 =====================
 MAX_ROUNDS=${MAX_ROUNDS:-5}                      # 最大迭代轮数
 EARLY_STOP_RATE=${EARLY_STOP_RATE:-0.5}          # 平均得分率低于该值时停止
@@ -15,27 +28,46 @@ MIN_SCORE_RATE=${MIN_SCORE_RATE:-0.8}            # legacy question_evolution 触
 NUM_CANDIDATES=${NUM_CANDIDATES:-2}              # 每条待进化样本最多生成候选数，范围 1-4
 MAX_CANDIDATE_BUDGET=${MAX_CANDIDATE_BUDGET:-0}  # 单轮候选总预算；0 表示待进化样本数 * 2
 VALIDATION_RETRIES=${VALIDATION_RETRIES:-1}      # validate-retry 次数；当前最多 1 次
+ENABLE_TREE_SEARCH=${ENABLE_TREE_SEARCH:-false}  # 是否启用树搜索/frontier 调度
+MAX_SAMPLE_BRANCHES=${MAX_SAMPLE_BRANCHES:-3}
+MAX_SAMPLE_DEPTH=${MAX_SAMPLE_DEPTH:-2}
+MAX_SAMPLE_BOUNDARIES=${MAX_SAMPLE_BOUNDARIES:-2}
+MAX_SAMPLE_CANDIDATES_TOTAL=${MAX_SAMPLE_CANDIDATES_TOTAL:-6}
+ENABLE_BRANCH_BACKTRACK=${ENABLE_BRANCH_BACKTRACK:-true}
+ENABLE_ROOT_FORK=${ENABLE_ROOT_FORK:-true}
 
 DEFAULT_INPUT_FILE="data/data.jsonl"
-LEGACY_INPUT_FILE="data/data.jsonl"
-INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}    # 推荐输入：已完成准入的种子样本
+INPUT_FILE=${INPUT_FILE:-$DEFAULT_INPUT_FILE}    # 默认输入：当前仓库 data/data.jsonl
 EXP_ROOT=${EXP_ROOT:-"experiments"}              # 实验结果根目录
 
+CONFIG_OPENAI_BASE_URL=$(config_value "" "OPENAI_BASE_URL" "BASE_URL")
+CONFIG_GPT_MODEL=$(config_value "gpt-5.4" "GPT_MODEL" "QA_MODEL")
+CONFIG_PROFILE_MODEL=$(config_value "$CONFIG_GPT_MODEL" "PROFILE_MODEL" "EVOLVE_MODEL" "QA_MODEL" "GPT_MODEL")
+CONFIG_EVOLVE_MODEL=$(config_value "$CONFIG_GPT_MODEL" "EVOLVE_MODEL" "QA_MODEL" "GPT_MODEL")
+CONFIG_PROFILE_BASE_URL=$(config_value "$CONFIG_OPENAI_BASE_URL" "PROFILE_BASE_URL" "EVOLVE_BASE_URL" "BASE_URL" "OPENAI_BASE_URL")
+CONFIG_EVOLVE_BASE_URL=$(config_value "$CONFIG_OPENAI_BASE_URL" "EVOLVE_BASE_URL" "BASE_URL" "OPENAI_BASE_URL")
+CONFIG_ANSWER_BASE_URL=$(config_value "$CONFIG_OPENAI_BASE_URL" "ANSWER_BASE_URL" "BASE_URL" "OPENAI_BASE_URL")
+CONFIG_RUBRIC_BASE_URL=$(config_value "$CONFIG_OPENAI_BASE_URL" "RUBRIC_BASE_URL" "BASE_URL" "OPENAI_BASE_URL")
+CONFIG_QWEN_BASE_URL=$(config_value "" "QWEN_BASE_URL" "JUDGE_BASE_URL" "BASE_URL" "OPENAI_BASE_URL")
+CONFIG_QWEN_API_KEY=$(config_value "" "QWEN_API_KEY" "JUDGE_API_KEY" "JUDGE_API_KEYS" "HIAPI_KEYS_BIG" "OPENAI_API_KEY")
+CONFIG_QWEN_MODEL=$(config_value "hjl_Qwen3.6-27B" "QWEN_MODEL" "JUDGE_MODEL" "ANSWER_MODEL")
+
 # Qwen（候选模型 / 评分模型）配置
+QWEN_BASE_URL=${QWEN_BASE_URL:-$CONFIG_QWEN_BASE_URL}
 QWEN_BASE_URL=${QWEN_BASE_URL:-"http://127.0.0.1:18011/v1"}
-QWEN_API_KEY=${QWEN_API_KEY:-""}
-QWEN_MODEL=${QWEN_MODEL:-"hjl_Qwen3.6-27B"}
+QWEN_API_KEY=${QWEN_API_KEY:-$CONFIG_QWEN_API_KEY}
+QWEN_MODEL=${QWEN_MODEL:-$CONFIG_QWEN_MODEL}
 
 # GPT / OpenAI-compatible 配置。API key 优先使用各脚本支持的环境变量：
 # PROFILE_API_KEYS、EVOLVE_API_KEYS、OPENAI_API_KEYS 或 OPENAI_API_KEY。
-GPT_MODEL=${GPT_MODEL:-"gpt-5.4"}
-OPENAI_BASE_URL=${OPENAI_BASE_URL:-""}
-PROFILE_MODEL=${PROFILE_MODEL:-$GPT_MODEL}
-PROFILE_BASE_URL=${PROFILE_BASE_URL:-$OPENAI_BASE_URL}
-EVOLVE_MODEL=${EVOLVE_MODEL:-$GPT_MODEL}
-EVOLVE_BASE_URL=${EVOLVE_BASE_URL:-$OPENAI_BASE_URL}
-ANSWER_BASE_URL=${ANSWER_BASE_URL:-$OPENAI_BASE_URL}
-RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$OPENAI_BASE_URL}
+GPT_MODEL=${GPT_MODEL:-$CONFIG_GPT_MODEL}
+OPENAI_BASE_URL=${OPENAI_BASE_URL:-$CONFIG_OPENAI_BASE_URL}
+PROFILE_MODEL=${PROFILE_MODEL:-$CONFIG_PROFILE_MODEL}
+PROFILE_BASE_URL=${PROFILE_BASE_URL:-$CONFIG_PROFILE_BASE_URL}
+EVOLVE_MODEL=${EVOLVE_MODEL:-$CONFIG_EVOLVE_MODEL}
+EVOLVE_BASE_URL=${EVOLVE_BASE_URL:-$CONFIG_EVOLVE_BASE_URL}
+ANSWER_BASE_URL=${ANSWER_BASE_URL:-$CONFIG_ANSWER_BASE_URL}
+RUBRIC_BASE_URL=${RUBRIC_BASE_URL:-$CONFIG_RUBRIC_BASE_URL}
 
 # 并发数
 SCORING_CONCURRENCY=${SCORING_CONCURRENCY:-10}
@@ -45,14 +77,9 @@ ANSWER_CONCURRENCY=${ANSWER_CONCURRENCY:-10}
 RUBRIC_CONCURRENCY=${RUBRIC_CONCURRENCY:-10}
 # ======================================================
 
-if [ ! -f "$INPUT_FILE" ] && [ "$INPUT_FILE" = "$DEFAULT_INPUT_FILE" ] && [ -f "$LEGACY_INPUT_FILE" ]; then
-    echo "未找到 $DEFAULT_INPUT_FILE，回退到旧输入文件: $LEGACY_INPUT_FILE"
-    INPUT_FILE="$LEGACY_INPUT_FILE"
-fi
-
 if [ ! -f "$INPUT_FILE" ]; then
     echo "输入文件不存在: $INPUT_FILE"
-    echo "请设置 INPUT_FILE 指向 admitted_seed_samples.jsonl 或其他已准入 JSONL。"
+    echo "请设置 INPUT_FILE 指向 data/data.jsonl 或其他 JSONL。"
     exit 1
 fi
 
@@ -106,19 +133,49 @@ compute_avg_score_rate() {
 import json, sys
 path = sys.argv[1]
 rates = []
+def clamp_rate(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, number))
 with open(path, "r", encoding="utf-8") as f:
     for line in f:
         line = line.strip()
         if not line:
             continue
         item = json.loads(line)
+        score_rate = clamp_rate(item.get("score_rate"))
+        if score_rate is not None:
+            rates.append(score_rate)
+            continue
         sr = item.get("scoring_result", {})
-        awarded = sr.get("total_awarded", 0) or 0
-        possible = sr.get("total_possible", 0) or 0
+        if not isinstance(sr, dict):
+            continue
+        try:
+            awarded = float(sr.get("total_awarded", 0) or 0)
+            possible = float(sr.get("total_possible", 0) or 0)
+        except (TypeError, ValueError):
+            continue
         if possible > 0:
-            rates.append(awarded / possible)
+            rates.append(max(0.0, min(1.0, awarded / possible)))
 avg = sum(rates) / len(rates) if rates else 0.0
 print(f"{avg:.4f}")
+PY
+}
+
+count_jsonl_records() {
+    local jsonl_file="$1"
+    python - "$jsonl_file" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    print(0)
+else:
+    with path.open("r", encoding="utf-8") as f:
+        print(sum(1 for line in f if line.strip()))
 PY
 }
 
@@ -163,6 +220,8 @@ echo "Evolution trigger rate: $MIN_SCORE_RATE" >> "$SUMMARY_FILE"
 echo "Num candidates: $NUM_CANDIDATES" >> "$SUMMARY_FILE"
 echo "Max candidate budget: $MAX_CANDIDATE_BUDGET" >> "$SUMMARY_FILE"
 echo "Validation retries: $VALIDATION_RETRIES" >> "$SUMMARY_FILE"
+echo "Tree search enabled: $ENABLE_TREE_SEARCH" >> "$SUMMARY_FILE"
+echo "Tree search budget: branches=$MAX_SAMPLE_BRANCHES depth=$MAX_SAMPLE_DEPTH boundaries=$MAX_SAMPLE_BOUNDARIES candidates=$MAX_SAMPLE_CANDIDATES_TOTAL" >> "$SUMMARY_FILE"
 echo "" >> "$SUMMARY_FILE"
 echo "Round | Avg Score Rate | Status" >> "$SUMMARY_FILE"
 echo "------|----------------|--------" >> "$SUMMARY_FILE"
@@ -193,6 +252,12 @@ run_if_missing "$ROUND_DIR/scored.jsonl" "[Round $ROUND] Step 1/2: scoring.py ba
         --judge-model "$QWEN_MODEL" \
         --concurrency "$SCORING_CONCURRENCY"
 
+BASELINE_RECORD_COUNT=$(count_jsonl_records "$ROUND_DIR/scored.jsonl")
+if [ "$BASELINE_RECORD_COUNT" -eq 0 ]; then
+    echo "Round 0 baseline 没有产生有效评分记录，停止运行。请检查 $ROUND_DIR/scored.jsonl.failed 以及 API base_url/model/key 配置。" >&2
+    exit 1
+fi
+
 AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
 echo "Round $ROUND 平均得分率: $AVG_RATE"
 printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "baseline" >> "$SUMMARY_FILE"
@@ -201,6 +266,12 @@ PREV_SCORED="$ROUND_DIR/scored.jsonl"
 PREV_AVG_RATE="$AVG_RATE"
 PREV_EFFECT_COUNT=0
 NO_INFO_STREAK=0
+LAST_SEARCH_GRAPH=""
+LAST_DISCOVERED_BOUNDARIES=""
+LAST_FINAL_SCORED="$PREV_SCORED"
+LAST_FRONTIER=""
+COMBINED_SEARCH_GRAPH="$EXP_DIR/search_graph.jsonl"
+COMBINED_DISCOVERED_BOUNDARIES="$EXP_DIR/discovered_boundaries.jsonl"
 
 # ===================== Round 1..N: 循环进化 =====================
 for ROUND in $(seq 1 "$MAX_ROUNDS"); do
@@ -212,8 +283,30 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
     echo "Round $ROUND: Question Evolution"
     echo "========================================"
 
-    run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/11: 复制上一轮 scored/state 输入" \
-        cp "$PREV_SCORED" "$ROUND_DIR/input.jsonl"
+    if [ "$ENABLE_TREE_SEARCH" = "true" ]; then
+        run_if_missing "$ROUND_DIR/active_frontier.jsonl" "[Round $ROUND] Tree Step 0a/12: frontier_scheduler.py active_frontier" \
+            python frontier_scheduler.py \
+                --mode active \
+                --input "$PREV_SCORED" \
+                --output "$ROUND_DIR/active_frontier.jsonl" \
+                --max-sample-branches "$MAX_SAMPLE_BRANCHES" \
+                --max-sample-depth "$MAX_SAMPLE_DEPTH" \
+                --max-sample-boundaries "$MAX_SAMPLE_BOUNDARIES" \
+                --max-sample-candidates-total "$MAX_SAMPLE_CANDIDATES_TOTAL"
+
+        run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/11: 复制 active_frontier 输入" \
+            cp "$ROUND_DIR/active_frontier.jsonl" "$ROUND_DIR/input.jsonl"
+    else
+        run_if_missing "$ROUND_DIR/input.jsonl" "[Round $ROUND] Step 0/11: 复制上一轮 scored/state 输入" \
+            cp "$PREV_SCORED" "$ROUND_DIR/input.jsonl"
+    fi
+
+    ROUND_INPUT_COUNT=$(count_jsonl_records "$ROUND_DIR/input.jsonl")
+    if [ "$ROUND_INPUT_COUNT" -eq 0 ]; then
+        echo "Round $ROUND 输入为空，停止循环。"
+        printf "%5s | %14s | %s\n" "$ROUND" "$PREV_AVG_RATE" "input_empty" >> "$SUMMARY_FILE"
+        break
+    fi
 
     if [ -f "$ROUND_DIR/scored.jsonl" ] && [ -s "$ROUND_DIR/scored.jsonl" ]; then
         echo "检测到已存在 $ROUND_DIR/scored.jsonl，跳过本轮生成闭环"
@@ -249,6 +342,13 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --num-candidates "$NUM_CANDIDATES" \
                 --max-candidate-budget "$MAX_CANDIDATE_BUDGET" \
                 --validation-retries "$VALIDATION_RETRIES"
+
+        CANDIDATE_COUNT=$(count_jsonl_records "$ROUND_DIR/candidates.jsonl")
+        if [ "$CANDIDATE_COUNT" -eq 0 ]; then
+            echo "Round $ROUND 未生成候选题，停止循环。"
+            printf "%5s | %14s | %s\n" "$ROUND" "$PREV_AVG_RATE" "candidate_empty" >> "$SUMMARY_FILE"
+            break
+        fi
 
         run_if_missing "$ROUND_DIR/validated_candidates.jsonl" "[Round $ROUND] Step 5/11: validate_evolved_question.py" \
             python validate_evolved_question.py \
@@ -290,6 +390,12 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
                 --judge-api-key "$QWEN_API_KEY" \
                 --judge-model "$QWEN_MODEL" \
                 --concurrency "$SCORING_CONCURRENCY"
+
+        ROUND_SCORED_COUNT=$(count_jsonl_records "$ROUND_DIR/scored.jsonl")
+        if [ "$ROUND_SCORED_COUNT" -eq 0 ]; then
+            echo "Round $ROUND 没有产生有效评分记录，停止运行。请检查 $ROUND_DIR/scored.jsonl.failed 以及 API base_url/model/key 配置。" >&2
+            exit 1
+        fi
     fi
 
     run_if_missing "$ROUND_DIR/effect_analysis.jsonl" "[Round $ROUND] Step 10/11: analyze_evolution_effect.py" \
@@ -305,15 +411,49 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
             --output "$ROUND_DIR/state_updated.jsonl" \
             --memory-dir "$MEMORY_DIR"
 
+    if [ "$ENABLE_TREE_SEARCH" = "true" ]; then
+        echo "[Round $ROUND] Step 12/13: build_search_graph.py（刷新本轮与累计树搜索产物）"
+        python build_search_graph.py \
+            --input "$ROUND_DIR/state_updated.jsonl" \
+            --output "$ROUND_DIR/search_graph.jsonl" \
+            --discovered-output "$ROUND_DIR/discovered_boundaries.jsonl" \
+            --previous-graph "$COMBINED_SEARCH_GRAPH" \
+            --combined-output "$COMBINED_SEARCH_GRAPH" \
+            --previous-discovered "$COMBINED_DISCOVERED_BOUNDARIES" \
+            --combined-discovered-output "$COMBINED_DISCOVERED_BOUNDARIES"
+
+        run_if_missing "$ROUND_DIR/next_frontier.jsonl" "[Round $ROUND] Step 13/13: frontier_scheduler.py next_frontier" \
+            python frontier_scheduler.py \
+                --mode schedule \
+                --input "$ROUND_DIR/state_updated.jsonl" \
+                --output "$ROUND_DIR/next_frontier.jsonl" \
+                --discovered-output "$ROUND_DIR/discovered_boundaries.jsonl" \
+                --max-sample-branches "$MAX_SAMPLE_BRANCHES" \
+                --max-sample-depth "$MAX_SAMPLE_DEPTH" \
+                --max-sample-boundaries "$MAX_SAMPLE_BOUNDARIES" \
+                --max-sample-candidates-total "$MAX_SAMPLE_CANDIDATES_TOTAL" \
+                --enable-branch-backtrack "$ENABLE_BRANCH_BACKTRACK" \
+                --enable-root-fork "$ENABLE_ROOT_FORK"
+
+        LAST_SEARCH_GRAPH="$COMBINED_SEARCH_GRAPH"
+        LAST_DISCOVERED_BOUNDARIES="$COMBINED_DISCOVERED_BOUNDARIES"
+    fi
+
     # 计算本轮平均得分率
     AVG_RATE=$(compute_avg_score_rate "$ROUND_DIR/scored.jsonl")
     echo "Round $ROUND 平均得分率: $AVG_RATE"
     EFFECT_COUNT=$(extract_effect_count "$ROUND_DIR/effect_analysis.jsonl")
     AVG_DELTA=$(abs_diff_float "$AVG_RATE" "$PREV_AVG_RATE")
 
-    ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/scored.jsonl"
+    ROUND_RESULT_FOR_FINAL="$ROUND_DIR/scored.jsonl"
     if [ -f "$ROUND_DIR/state_updated.jsonl" ] && [ -s "$ROUND_DIR/state_updated.jsonl" ]; then
-        ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/state_updated.jsonl"
+        ROUND_RESULT_FOR_FINAL="$ROUND_DIR/state_updated.jsonl"
+    fi
+    LAST_FINAL_SCORED="$ROUND_RESULT_FOR_FINAL"
+    ROUND_OUTPUT_FOR_NEXT="$ROUND_RESULT_FOR_FINAL"
+    if [ "$ENABLE_TREE_SEARCH" = "true" ] && [ -f "$ROUND_DIR/next_frontier.jsonl" ] && [ -s "$ROUND_DIR/next_frontier.jsonl" ]; then
+        LAST_FRONTIER="$ROUND_DIR/next_frontier.jsonl"
+        ROUND_OUTPUT_FOR_NEXT="$ROUND_DIR/next_frontier.jsonl"
     fi
 
     # 检查提前停止条件
@@ -338,6 +478,14 @@ for ROUND in $(seq 1 "$MAX_ROUNDS"); do
         break
     fi
 
+    if [ "$ENABLE_TREE_SEARCH" = "true" ] && { [ ! -f "$ROUND_DIR/next_frontier.jsonl" ] || [ ! -s "$ROUND_DIR/next_frontier.jsonl" ]; }; then
+        echo "树搜索停止：Round $ROUND 未生成新的 next_frontier。"
+        printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "tree_frontier_empty" >> "$SUMMARY_FILE"
+        LAST_FRONTIER=""
+        PREV_SCORED="$ROUND_RESULT_FOR_FINAL"
+        break
+    fi
+
     printf "%5s | %14s | %s\n" "$ROUND" "$AVG_RATE" "continue" >> "$SUMMARY_FILE"
 
     PREV_SCORED="$ROUND_OUTPUT_FOR_NEXT"
@@ -348,7 +496,18 @@ done
 # ===================== 保存最终结果 =====================
 FINAL_DIR="$EXP_DIR/final"
 mkdir -p "$FINAL_DIR"
-cp "$PREV_SCORED" "$FINAL_DIR/final_scored.jsonl"
+cp "$LAST_FINAL_SCORED" "$FINAL_DIR/final_scored.jsonl"
+if [ "$ENABLE_TREE_SEARCH" = "true" ]; then
+    if [ -n "$LAST_FRONTIER" ] && [ -f "$LAST_FRONTIER" ]; then
+        cp "$LAST_FRONTIER" "$FINAL_DIR/final_frontier.jsonl"
+    fi
+    if [ -n "$LAST_SEARCH_GRAPH" ] && [ -f "$LAST_SEARCH_GRAPH" ]; then
+        cp "$LAST_SEARCH_GRAPH" "$FINAL_DIR/search_graph.jsonl"
+    fi
+    if [ -n "$LAST_DISCOVERED_BOUNDARIES" ] && [ -f "$LAST_DISCOVERED_BOUNDARIES" ]; then
+        cp "$LAST_DISCOVERED_BOUNDARIES" "$FINAL_DIR/discovered_boundaries.jsonl"
+    fi
+fi
 
 echo ""
 echo "========================================"

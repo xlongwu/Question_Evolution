@@ -10,6 +10,12 @@ from select_evolution_candidates import (
     STOP_EVOLUTION,
     get_score_rate,
 )
+from search_state import (
+    first_unexplored_axis,
+    init_search_state,
+    normalize_axis_candidates,
+    operator_axis,
+)
 
 
 O1_GAP_CHOICE = "O1_gap_choice"
@@ -279,6 +285,96 @@ def _recommended_next_methods(item: Dict[str, Any]) -> List[str]:
     return operators
 
 
+def _boundary_axis_candidates(item: Dict[str, Any]) -> List[str]:
+    state = get_evolution_state(item)
+    profile = item.get("sample_profile")
+    candidates: List[str] = []
+    for source in (
+        state.get("recommended_next_axes"),
+        item.get("boundary_axis_candidates"),
+        item.get("next_best_axes"),
+    ):
+        if isinstance(source, list):
+            _append_unique(candidates, [_clean_text(value) for value in source])
+    if isinstance(profile, dict):
+        for field in ("boundary_axis_candidates", "next_best_axes"):
+            source = profile.get(field)
+            if isinstance(source, list):
+                _append_unique(candidates, [_clean_text(value) for value in source])
+    return normalize_axis_candidates(candidates)
+
+
+def _explored_axes(item: Dict[str, Any]) -> List[str]:
+    state = get_evolution_state(item)
+    axes: List[str] = []
+    source = state.get("explored_axes")
+    if isinstance(source, list):
+        _append_unique(axes, [_clean_text(value) for value in source])
+    boundaries = state.get("discovered_boundaries")
+    if isinstance(boundaries, list):
+        for boundary in boundaries:
+            if isinstance(boundary, dict):
+                _append_unique(axes, [_clean_text(boundary.get("boundary_axis"))])
+    return axes
+
+
+def _operator_for_axis(axis: str, candidates: Sequence[str]) -> Optional[str]:
+    if not axis:
+        return None
+    for operator in candidates:
+        if operator and operator_axis(operator) == axis:
+            return operator
+    return None
+
+
+def _tree_branch_context(
+    item: Dict[str, Any],
+    primary: Optional[str],
+    backups: Sequence[str],
+) -> Dict[str, Any]:
+    state = get_evolution_state(item)
+    root_state = init_search_state(item)
+    search_root_id = _clean_text(
+        item.get("search_root_id")
+        or state.get("search_root_id")
+        or root_state["search_root_id"]
+    )
+    source_node_id = _clean_text(
+        item.get("source_node_id")
+        or state.get("current_node_id")
+        or search_root_id
+    )
+    parent_node_id = _clean_text(
+        item.get("parent_node_id")
+        or state.get("parent_node_id")
+        or (search_root_id if source_node_id != search_root_id else search_root_id)
+    )
+    branch_action = _clean_text(item.get("branch_action") or state.get("branch_action"))
+    if branch_action not in {"expand_current_branch", "fork_from_parent", "fork_from_root"}:
+        branch_action = "expand_current_branch"
+
+    operator_candidates = [operator for operator in [primary] + list(backups) if operator]
+    requested_axis = _clean_text(item.get("boundary_axis") or state.get("boundary_axis"))
+    available_axes = _boundary_axis_candidates(item)
+    explored = _explored_axes(item)
+    boundary_axis = requested_axis or first_unexplored_axis(
+        axis_candidates=available_axes,
+        explored_axes=explored,
+        fallback_axis=operator_axis(primary) if primary else "",
+    )
+    axis_operator = _operator_for_axis(boundary_axis, operator_candidates)
+
+    return {
+        "search_root_id": search_root_id,
+        "source_node_id": source_node_id,
+        "parent_node_id": parent_node_id,
+        "branch_action": branch_action,
+        "boundary_axis": boundary_axis,
+        "axis_preferred_operator": axis_operator,
+        "explored_axes": explored,
+    }
+
+
 def _is_current_full_score(item: Dict[str, Any], full_score_threshold: float) -> bool:
     score_rate = get_score_rate(item)
     if score_rate is None:
@@ -381,6 +477,29 @@ def build_operator_route(
                 "recommended_next_methods from evolution_state are prioritized before fallback rule routing."
             )
 
+    tree_context = _tree_branch_context(item, primary, backups)
+    if tree_context["axis_preferred_operator"] and tree_context["axis_preferred_operator"] != primary:
+        previous_primary = primary
+        primary = tree_context["axis_preferred_operator"]
+        backups = [operator for operator in [previous_primary] + list(backups) if operator and operator != primary]
+        reason_parts.append(
+            f"boundary_axis={tree_context['boundary_axis']} promotes {primary} for tree-search branch."
+        )
+    elif primary and operator_axis(primary) in tree_context["explored_axes"]:
+        replacement = next(
+            (
+                operator
+                for operator in backups
+                if operator_axis(operator) and operator_axis(operator) not in tree_context["explored_axes"]
+            ),
+            None,
+        )
+        if replacement:
+            backups = [operator for operator in [primary] + list(backups) if operator != replacement]
+            primary = replacement
+            tree_context["boundary_axis"] = operator_axis(primary)
+            reason_parts.append("tree-search explored_axes avoid repeating the same boundary axis.")
+
     backups = _remove_values(backups, [primary] if primary else [])
     backups = _remove_values(backups, avoid)
     if primary in avoid:
@@ -409,6 +528,11 @@ def build_operator_route(
             "operator": operator_matches[:3],
             "failure": failure_matches[:3],
         },
+        "search_root_id": tree_context["search_root_id"],
+        "source_node_id": tree_context["source_node_id"],
+        "parent_node_id": tree_context["parent_node_id"],
+        "branch_action": tree_context["branch_action"],
+        "boundary_axis": tree_context["boundary_axis"] or (operator_axis(primary) if primary else ""),
     }
 
 

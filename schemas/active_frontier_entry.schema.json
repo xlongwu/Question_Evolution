@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Active Frontier Entry",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "sample_id",
+    "search_root_id",
+    "source_node_id",
+    "branch_id",
+    "branch_action",
+    "boundary_axis",
+    "search_depth",
+    "prompt",
+    "evolution_state"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "search_root_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": ["string", "null"]
+    },
+    "branch_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch_action": {
+      "enum": [
+        "expand_current_branch",
+        "fork_from_parent",
+        "fork_from_root"
+      ]
+    },
+    "boundary_axis": {
+      "type": "string",
+      "minLength": 1
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "target_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "evolution_state": {
+      "type": "object"
+    }
+  }
+}

@@ -9,6 +9,12 @@ from analyze_evolution_effect import (
     is_question_evolved,
     load_json_or_jsonl,
 )
+from search_state import (
+    DEFAULT_BOUNDARY_AXES,
+    boundary_signature,
+    init_search_state,
+    resolve_boundary_axis,
+)
 
 
 FAILURE_EFFECT_LABELS = {
@@ -49,6 +55,21 @@ NEXT_OPERATOR_HINTS = {
     "O8_double_threshold_claim": ["O2_subclaim_localization", "O4_near_level_ranking"],
     "O9_abnormal_clue_mainline_switch": ["O6_single_variable_counterfactual", "O4_near_level_ranking"],
 }
+
+NODE_RECORD_FIELDS = (
+    "sample_id",
+    "index",
+    "prompt",
+    "meta_info",
+    "rubric",
+    "rubric_thought_process",
+    "score_prompt",
+    "scoring_result",
+    "score_rate",
+    "sample_profile",
+    "overscore_diagnosis",
+    "evolution_action",
+)
 
 
 def write_jsonl(records: Iterable[Dict[str, Any]], output_path: str, *, append: bool = False) -> None:
@@ -175,6 +196,202 @@ def _recommended_next_methods(operator_used: str, label: str, full_score_count: 
     return hints
 
 
+def _candidate_generation(item: Dict[str, Any]) -> Dict[str, Any]:
+    generation = item.get("candidate_generation")
+    return generation if isinstance(generation, dict) else {}
+
+
+def _search_int(value: Any, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
+
+
+def _compact_node_record(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {field: item[field] for field in NODE_RECORD_FIELDS if field in item}
+
+
+def _build_boundary_entry(item: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    effect = _effect(item)
+    generation = _candidate_generation(item)
+    axis = _clean_text(effect.get("boundary_axis_detected")) or resolve_boundary_axis(item)
+    signature = _clean_text(effect.get("boundary_signature")) or boundary_signature(item)
+    node_id = _clean_text(state.get("current_node_id"))
+    parent_node_id = state.get("parent_node_id")
+    return {
+        "boundary_id": f"boundary_{len(state.get('discovered_boundaries') or []) + 1:03d}",
+        "boundary_axis": axis,
+        "trigger_node_id": node_id,
+        "node_id": node_id,
+        "parent_node_id": _clean_text(parent_node_id) or None,
+        "depth": _search_int(state.get("search_depth"), 0),
+        "branch_id": _clean_text(state.get("branch_id")),
+        "operator_used": _clean_text(effect.get("operator_used")) or _clean_text(generation.get("operator_id")),
+        "score_rate_before": effect.get("score_rate_before"),
+        "score_rate_after": effect.get("score_rate_after"),
+        "effect_label": _clean_text(effect.get("effect_label")),
+        "dedup_signature": signature,
+    }
+
+
+def _merge_search_state(item: Dict[str, Any], next_state: Dict[str, Any]) -> Dict[str, Any]:
+    effect = _effect(item)
+    generation = _candidate_generation(item)
+    previous_state = _previous_state(item)
+    search_state = init_search_state(item)
+    search_state.update(previous_state)
+    search_state.update(next_state)
+
+    search_root_id = _clean_text(
+        generation.get("search_root_id")
+        or previous_state.get("search_root_id")
+        or search_state.get("search_root_id")
+    )
+    current_node_id = _clean_text(
+        generation.get("node_id")
+        or generation.get("candidate_node_id")
+        or previous_state.get("current_node_id")
+        or search_root_id
+    )
+    parent_node_id = generation.get("parent_node_id", previous_state.get("parent_node_id"))
+    branch_id = generation.get("branch_id", previous_state.get("branch_id"))
+    branch_action = _clean_text(generation.get("branch_action") or previous_state.get("branch_action") or "expand_current_branch")
+    boundary_axis = _clean_text(effect.get("boundary_axis_detected")) or _clean_text(
+        generation.get("boundary_axis") or previous_state.get("boundary_axis")
+    ) or resolve_boundary_axis(item)
+
+    depth = _search_int(generation.get("search_depth"), _search_int(previous_state.get("search_depth"), 0))
+    source_depth = _search_int(generation.get("source_search_depth"), max(0, depth - 1))
+    target_depth = _search_int(generation.get("target_search_depth"), depth)
+    max_depth = _search_int(previous_state.get("max_search_depth"), _search_int(search_state.get("max_search_depth"), 2))
+    max_branches = _search_int(previous_state.get("max_sample_branches"), _search_int(search_state.get("max_sample_branches"), 3))
+    max_boundaries = _search_int(previous_state.get("max_sample_boundaries"), _search_int(search_state.get("max_sample_boundaries"), 2))
+    max_candidates = _search_int(
+        previous_state.get("max_sample_candidates_total"),
+        _search_int(search_state.get("max_sample_candidates_total"), 6),
+    )
+    used = _search_int(previous_state.get("sample_candidates_used"), 0)
+    if is_question_evolved(item):
+        used += 1
+
+    branch_count = _search_int(previous_state.get("branch_count"), 0)
+    branch_index = _search_int(generation.get("branch_index"), 0)
+    if branch_action in {"fork_from_parent", "fork_from_root"} or branch_count == 0:
+        branch_count = max(branch_count + (1 if branch_index == 0 else 0), branch_index, 1)
+
+    discovered = list(previous_state.get("discovered_boundaries") or [])
+    known_signatures = {
+        _clean_text(boundary.get("dedup_signature") or boundary.get("boundary_signature"))
+        for boundary in discovered
+        if isinstance(boundary, dict)
+    }
+    signature = _clean_text(effect.get("boundary_signature")) or boundary_signature(item)
+    if (
+        _clean_text(effect.get("effect_label")) == "effective_boundary_probe"
+        and effect.get("is_new_boundary_for_sample") is not False
+        and signature
+        and signature not in known_signatures
+    ):
+        discovered.append(
+            _build_boundary_entry(
+                item,
+                {
+                    **search_state,
+                    "current_node_id": current_node_id,
+                    "parent_node_id": parent_node_id,
+                    "branch_id": branch_id,
+                    "search_depth": depth,
+                    "discovered_boundaries": discovered,
+                },
+            )
+        )
+
+    explored_axes = list(previous_state.get("explored_axes") or [])
+    if _clean_text(effect.get("effect_label")) in {"effective_boundary_probe", "repeated_pattern", "invalid_complexity"}:
+        _append_unique(explored_axes, [boundary_axis])
+
+    label = _clean_text(effect.get("effect_label"))
+    if label == "effective_boundary_probe":
+        branch_status = "boundary_hit"
+    elif label == "invalid_complexity":
+        branch_status = "invalid"
+    elif label == "repeated_pattern":
+        branch_status = "duplicate"
+    elif depth >= max_depth:
+        branch_status = "depth_exhausted"
+    else:
+        branch_status = "exploring"
+
+    if len(discovered) >= max_boundaries:
+        sample_stop_status = "max_boundaries_reached"
+    elif used >= max_candidates:
+        sample_stop_status = "budget_exhausted"
+    elif branch_count >= max_branches and label in {"effective_boundary_probe", "repeated_pattern"}:
+        sample_stop_status = "budget_exhausted"
+    else:
+        sample_stop_status = "continue_branch_search"
+
+    recommended_axes = list(previous_state.get("recommended_next_axes") or DEFAULT_BOUNDARY_AXES)
+    node_prompts = dict(previous_state.get("node_prompts") or {})
+    node_records = dict(previous_state.get("node_records") or {})
+    if search_root_id and search_root_id not in node_prompts:
+        meta_info = item.get("meta_info")
+        meta_info = meta_info if isinstance(meta_info, dict) else {}
+        root_prompt = _clean_text(meta_info.get("prompt_old")) or _clean_text(item.get("prompt"))
+        if root_prompt:
+            node_prompts[search_root_id] = root_prompt
+    if search_root_id and search_root_id not in node_records:
+        meta_info = item.get("meta_info")
+        meta_info = meta_info if isinstance(meta_info, dict) else {}
+        root_prompt = _clean_text(meta_info.get("prompt_old"))
+        if root_prompt:
+            root_record = _compact_node_record(item)
+            root_record["prompt"] = root_prompt
+            if "stale_rubric" in meta_info:
+                root_record["rubric"] = meta_info.get("stale_rubric")
+            if "stale_score_prompt" in meta_info:
+                root_record["score_prompt"] = meta_info.get("stale_score_prompt")
+            if "stale_scoring_result" in meta_info:
+                root_record["scoring_result"] = meta_info.get("stale_scoring_result")
+            node_records[search_root_id] = root_record
+    if current_node_id:
+        node_prompts[current_node_id] = _clean_text(item.get("prompt"))
+        node_records[current_node_id] = _compact_node_record(item)
+
+    search_state.update(
+        {
+            "search_root_id": search_root_id,
+            "current_node_id": current_node_id,
+            "parent_node_id": parent_node_id,
+            "branch_id": branch_id,
+            "branch_index": branch_index,
+            "branch_action": branch_action,
+            "boundary_axis": boundary_axis,
+            "branch_status": branch_status,
+            "search_depth": depth,
+            "source_search_depth": source_depth,
+            "target_search_depth": target_depth,
+            "max_search_depth": max_depth,
+            "max_sample_branches": max_branches,
+            "max_sample_boundaries": max_boundaries,
+            "max_sample_candidates_total": max_candidates,
+            "branch_budget_remaining": max(0, max_depth - depth),
+            "sample_budget_remaining": max(0, max_candidates - used),
+            "sample_candidates_used": used,
+            "branch_count": branch_count,
+            "discovered_boundaries": discovered,
+            "explored_axes": explored_axes,
+            "recommended_next_axes": recommended_axes,
+            "node_prompts": node_prompts,
+            "node_records": node_records,
+            "sample_stop_status": sample_stop_status,
+        }
+    )
+    return search_state
+
+
 def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
     effect = _effect(item)
     previous_state = _previous_state(item)
@@ -211,7 +428,7 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
     if stop_status in TERMINAL_STOP_STATUSES:
         recommended = []
 
-    return {
+    next_state = {
         "round": _round_value(item, previous_state),
         "previous_operator": operator_used or None,
         "previous_score_rate": effect.get("score_rate_after"),
@@ -223,6 +440,7 @@ def build_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
         "recommended_next_methods": recommended,
         "stop_status": stop_status,
     }
+    return _merge_search_state(item, next_state)
 
 
 def attach_next_state(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -305,7 +523,12 @@ def classify_memory_entries(
     for record in records:
         effect = _effect(record)
         label = _clean_text(effect.get("effect_label"))
-        if effect.get("lightweight_boundary_hit") and effect.get("complexity_passed") and is_question_evolved(record):
+        if (
+            effect.get("lightweight_boundary_hit")
+            and effect.get("complexity_passed")
+            and effect.get("is_new_boundary_for_sample") is not False
+            and is_question_evolved(record)
+        ):
             operator_entries.append(build_operator_memory_entry(record))
         if label in FAILURE_EFFECT_LABELS and effect.get("complexity_passed") and is_question_evolved(record):
             failure_entries.append(build_failure_memory_entry(record))

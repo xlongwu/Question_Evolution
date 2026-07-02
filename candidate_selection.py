@@ -44,10 +44,19 @@ def _metadata(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def candidate_group_id(item: Dict[str, Any]) -> str:
+    branch_id = ""
+    generation = item.get("candidate_generation")
+    if isinstance(generation, dict):
+        branch_id = _clean_text(generation.get("branch_id"))
+    if not branch_id:
+        branch_id = _clean_text(item.get("branch_id"))
     for field in ("candidate_group_id", "sample_id", "index"):
         value = item.get(field)
         if value is not None and str(value).strip():
-            return str(value).strip()
+            base_id = str(value).strip()
+            if field == "candidate_group_id" or not branch_id:
+                return base_id
+            return f"{base_id}::{branch_id}"
     return _clean_text(item.get("prompt"))
 
 
@@ -151,7 +160,6 @@ def build_invalid_case(item: Dict[str, Any], fallback_index: int, *, reason: Opt
 
 def _strip_candidate_fields(item: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(item)
-    result.pop("candidate_generation", None)
     return result
 
 
@@ -186,6 +194,9 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
             "selected_operator": "",
             "selection_reason": "透传样本不参与候选选择。",
             "rejected_candidates": [],
+            "selected_into_mainline": False,
+            "selected_as_boundary_leaf": False,
+            "discard_as_duplicate": False,
         }
         return selected, []
 
@@ -209,6 +220,9 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
                 build_rejected_candidate(record, index)
                 for index, record in enumerate(records, start=1)
             ],
+            "selected_into_mainline": False,
+            "selected_as_boundary_leaf": False,
+            "discard_as_duplicate": False,
         }
         for index, record in enumerate(records, start=1):
             invalid_cases.append(build_invalid_case(record, index))
@@ -230,6 +244,9 @@ def select_group(records: Sequence[Dict[str, Any]]) -> Tuple[Dict[str, Any], Lis
         "selected_operator": selected_operator,
         "selection_reason": "；".join(best_reasons) if best_reasons else "通过复杂度校验且综合分最高。",
         "rejected_candidates": rejected_candidates,
+        "selected_into_mainline": True,
+        "selected_as_boundary_leaf": False,
+        "discard_as_duplicate": False,
     }
     return selected, invalid_cases
 

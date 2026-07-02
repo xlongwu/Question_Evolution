@@ -5,6 +5,8 @@ import re
 from collections import defaultdict
 from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from search_state import boundary_signature, discovered_signatures, resolve_boundary_axis
+
 
 DEFAULT_FULL_SCORE_THRESHOLD = 0.99
 DEFAULT_SCORE_DROP_THRESHOLD = 0.15
@@ -350,6 +352,17 @@ def build_effect_analysis(
         effect_label = "no_clear_effect"
         reason = "未观察到足够清晰的得分变化。"
 
+    previous_state = item.get("evolution_state")
+    previous_state = previous_state if isinstance(previous_state, dict) else {}
+    boundary_axis_detected = resolve_boundary_axis(item, get_operator_used(item))
+    signature = boundary_signature(item)
+    is_boundary_candidate = effect_label == "effective_boundary_probe" or bool(lightweight_boundary_hit)
+    is_new_boundary = (
+        is_boundary_candidate
+        and bool(signature)
+        and signature not in set(discovered_signatures(previous_state))
+    )
+
     return {
         "score_rate_before": score_rate_before,
         "score_rate_after": score_rate_after,
@@ -365,6 +378,9 @@ def build_effect_analysis(
         "focus_answer_alignment": focus_alignment,
         "lightweight_hit_reason": reason,
         "effect_label": effect_label,
+        "boundary_axis_detected": boundary_axis_detected,
+        "boundary_signature": signature,
+        "is_new_boundary_for_sample": is_new_boundary,
     }
 
 

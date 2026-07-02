@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Tree Search Node",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "sample_id",
+    "search_root_id",
+    "node_id",
+    "branch_id",
+    "depth",
+    "prompt",
+    "is_boundary_hit"
+  ],
+  "properties": {
+    "sample_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "search_root_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "node_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "parent_node_id": {
+      "type": ["string", "null"]
+    },
+    "branch_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "branch_action": {
+      "enum": [
+        "expand_current_branch",
+        "fork_from_parent",
+        "fork_from_root",
+        "stop_branch",
+        "stop_sample"
+      ]
+    },
+    "depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prompt": {
+      "type": "string"
+    },
+    "operator_used": {
+      "type": "string"
+    },
+    "boundary_axis": {
+      "type": "string"
+    },
+    "score_rate_before": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "score_rate_after": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "effect_label": {
+      "type": "string"
+    },
+    "is_boundary_hit": {
+      "type": "boolean"
+    },
+    "selected_into_mainline": {
+      "type": "boolean"
+    },
+    "selected_as_boundary_leaf": {
+      "type": "boolean"
+    },
+    "discard_as_duplicate": {
+      "type": "boolean"
+    },
+    "dedup_signature": {
+      "type": "string"
+    }
+  }
+}

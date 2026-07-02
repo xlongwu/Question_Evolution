@@ -178,7 +178,8 @@ async def run_tiny_pipeline(exp_dir: Path):
     for path in (operator_memory, failure_memory, invalid_memory):
         path.write_text("", encoding="utf-8")
 
-    seed_path = exp_dir / "admitted_seed_samples.jsonl"
+    seed_path = exp_dir / "data" / "data.jsonl"
+    seed_path.parent.mkdir(parents=True)
     seed = make_seed_record()
     write_jsonl(seed_path, [seed])
 
@@ -266,7 +267,7 @@ def test_tiny_pipeline_writes_stage06_artifacts_without_external_api():
         asyncio.run(run_tiny_pipeline(exp_dir))
 
         expected_files = [
-            "admitted_seed_samples.jsonl",
+            "data/data.jsonl",
             "round_0/input.jsonl",
             "round_0/scored.jsonl",
             "round_1/profiled.jsonl",

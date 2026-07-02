@@ -10,7 +10,6 @@ from typing import Any, Dict, Mapping, Optional
 
 from local_api_config import get_config_list, get_config_value
 
-REQUIRED_SEED_IDS = {"801", "13364", "14865", "8638", "7337", "18485", "6582", "5486"}
 REQUIRED_IMPORTS = ("openai", "aiofiles", "tqdm", "pytest")
 API_GROUPS = {
     "profile": ("PROFILE_API_KEYS", "EVOLVE_API_KEYS", "GPT_API_KEYS", "HIAPI_KEYS_BIG", "OPENAI_API_KEYS", "OPENAI_API_KEY"),
@@ -104,38 +103,35 @@ def _judge_config_ready(env: Mapping[str, str], config_path: Path) -> bool:
     return bool(base_url and model)
 
 
-def check_seed_file(root: Path, input_file: str) -> Dict[str, Any]:
+def check_input_file(root: Path, input_file: str) -> Dict[str, Any]:
     path = (root / input_file).resolve()
     result: Dict[str, Any] = {
         "path": str(path),
         "exists": path.exists(),
         "row_count": 0,
-        "required_ids_present": False,
-        "missing_required_ids": sorted(REQUIRED_SEED_IDS),
+        "jsonl_parseable": False,
+        "parse_error": None,
     }
     if not path.exists():
         return result
 
-    ids = set()
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            result["row_count"] += 1
-            item = json.loads(line)
-            value = item.get("index", item.get("sample_id"))
-            if value is not None:
-                ids.add(str(value))
-    missing = REQUIRED_SEED_IDS - ids
-    result["required_ids_present"] = not missing
-    result["missing_required_ids"] = sorted(missing)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                result["row_count"] += 1
+                json.loads(line)
+        result["jsonl_parseable"] = True
+    except Exception as exc:
+        result["parse_error"] = str(exc)
     return result
 
 
 def build_report(
     root: Path,
     *,
-    input_file: str = "admitted_seed_samples.jsonl",
+    input_file: str = "data/data.jsonl",
     env: Optional[Mapping[str, str]] = None,
     bash_path: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -145,11 +141,11 @@ def build_report(
     config_path = root / "config.py"
     api_config = {group: _has_value(env, names, config_path) for group, names in API_GROUPS.items()}
     api_config["judge"] = _judge_config_ready(env, config_path)
-    seed = check_seed_file(root, input_file)
+    input_data = check_input_file(root, input_file)
 
     checks = {
         "bash_available": bool(bash_path),
-        "admitted_seed_ready": bool(seed["exists"] and seed["required_ids_present"]),
+        "input_data_ready": bool(input_data["exists"] and input_data["row_count"] > 0 and input_data["jsonl_parseable"]),
         "python_dependencies_ready": all(imports.values()),
         "api_config_ready": all(api_config.values()),
     }
@@ -161,7 +157,7 @@ def build_report(
         "bash_path": bash_path,
         "python_imports": imports,
         "api_config": api_config,
-        "admitted_seed": seed,
+        "input_data": input_data,
         "next_commands": [
             f"{bash_command} -n run_loop.sh",
             f"INPUT_FILE={input_file} MAX_ROUNDS=1 {bash_command} run_loop.sh",
@@ -175,7 +171,7 @@ def build_report(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check runtime prerequisites for real Stage 06 Bash/API E2E validation.")
-    parser.add_argument("--input-file", default="admitted_seed_samples.jsonl")
+    parser.add_argument("--input-file", default="data/data.jsonl")
     parser.add_argument("--json", action="store_true", help="Only print JSON report.")
     args = parser.parse_args()
 

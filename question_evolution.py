@@ -16,6 +16,13 @@ from select_evolution_candidates import (
 )
 from local_api_config import get_config_list, get_config_value
 import validate_evolved_question as validation_stage
+from search_state import (
+    get_operator_used as get_search_operator_used,
+    init_search_state,
+    make_branch_id,
+    make_node_id,
+    resolve_boundary_axis,
+)
 
 
 # 默认使用与 rubric_evolution 相同的 strong model，可通过 CLI 或环境变量覆盖。
@@ -646,13 +653,146 @@ def resolve_operator_id(item: Dict[str, Any]) -> str:
 
 
 def get_candidate_group_id(item: Dict[str, Any]) -> str:
+    branch_id = ""
+    route = get_operator_route(item)
+    state = get_evolution_state(item)
+    for value in (item.get("branch_id"), route.get("branch_id"), state.get("branch_id")):
+        if isinstance(value, str) and value.strip():
+            branch_id = value.strip()
+            break
     for field in ("sample_id", "index"):
         value = item.get(field)
         if value is not None and str(value).strip():
-            return str(value).strip()
+            base_id = str(value).strip()
+            return f"{base_id}::{branch_id}" if branch_id else base_id
     prompt = str(item.get("prompt", "") or "")
     digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:12]
-    return f"prompt_{digest}"
+    base_id = f"prompt_{digest}"
+    return f"{base_id}::{branch_id}" if branch_id else base_id
+
+
+def _is_pending_branch_id(value: Any) -> bool:
+    text = str(value or "").strip()
+    return not text or text.startswith("branch_pending_")
+
+
+def _coerce_non_negative_int(value: Any, default: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number >= 0 else default
+
+
+def _search_generation_context(
+    item: Dict[str, Any],
+    *,
+    operator_id: Optional[str],
+    candidate_index: int,
+) -> Dict[str, Any]:
+    route = get_operator_route(item)
+    state = get_evolution_state(item)
+    root_state = init_search_state(item)
+    search_root_id = str(
+        route.get("search_root_id")
+        or item.get("search_root_id")
+        or state.get("search_root_id")
+        or root_state["search_root_id"]
+    ).strip()
+    branch_action = str(
+        route.get("branch_action")
+        or item.get("branch_action")
+        or state.get("branch_action")
+        or "expand_current_branch"
+    ).strip()
+    if branch_action not in {"expand_current_branch", "fork_from_parent", "fork_from_root"}:
+        branch_action = "expand_current_branch"
+
+    source_node_id = str(
+        route.get("source_node_id")
+        or item.get("source_node_id")
+        or state.get("current_node_id")
+        or search_root_id
+    ).strip()
+    parent_node_id = str(
+        route.get("parent_node_id")
+        or item.get("parent_node_id")
+        or state.get("parent_node_id")
+        or (search_root_id if source_node_id != search_root_id else search_root_id)
+    ).strip()
+
+    boundary_axis = str(
+        route.get("boundary_axis")
+        or item.get("boundary_axis")
+        or state.get("boundary_axis")
+        or resolve_boundary_axis(item, operator_id)
+        or ""
+    ).strip()
+
+    try:
+        current_branch_count = int(state.get("branch_count", 0) or 0)
+    except (TypeError, ValueError):
+        current_branch_count = 0
+    route_branch_index = _coerce_non_negative_int(
+        route.get("branch_index", item.get("branch_index", state.get("branch_index"))),
+        0,
+    )
+    if route_branch_index:
+        branch_index = route_branch_index
+    elif branch_action == "expand_current_branch":
+        branch_index = current_branch_count or 1
+    else:
+        branch_index = current_branch_count + candidate_index
+
+    existing_branch_id = ""
+    for value in (route.get("branch_id"), item.get("branch_id"), state.get("branch_id")):
+        if isinstance(value, str) and value.strip():
+            existing_branch_id = value.strip()
+            break
+    if (
+        branch_action == "expand_current_branch"
+        and existing_branch_id
+        and candidate_index == 1
+        and not _is_pending_branch_id(existing_branch_id)
+    ):
+        branch_id = existing_branch_id
+    else:
+        branch_id = make_branch_id(operator_id or get_search_operator_used(item) or "operator", boundary_axis, branch_index)
+
+    raw_search_depth = route.get("search_depth", item.get("search_depth", state.get("search_depth")))
+    raw_source_depth = route.get("source_search_depth", item.get("source_search_depth", state.get("source_search_depth")))
+    source_depth = _coerce_non_negative_int(
+        raw_source_depth,
+        _coerce_non_negative_int(raw_search_depth, 0),
+    )
+    explicit_target_depth = route.get("target_search_depth", item.get("target_search_depth", state.get("target_search_depth")))
+    if explicit_target_depth is not None:
+        search_depth = _coerce_non_negative_int(explicit_target_depth, source_depth + 1)
+    elif branch_action in {"fork_from_parent", "fork_from_root"} and raw_search_depth is not None:
+        search_depth = _coerce_non_negative_int(raw_search_depth, source_depth + 1)
+        if raw_source_depth is None:
+            source_depth = max(0, search_depth - 1)
+    else:
+        search_depth = source_depth + 1
+
+    if branch_action == "expand_current_branch":
+        parent_node_id = source_node_id
+
+    candidate_node_id = make_node_id(search_root_id, branch_index, search_depth)
+    return {
+        "search_root_id": search_root_id,
+        "source_node_id": source_node_id,
+        "parent_node_id": parent_node_id,
+        "branch_id": branch_id,
+        "branch_index": branch_index,
+        "branch_action": branch_action,
+        "boundary_axis": boundary_axis,
+        "source_search_depth": source_depth,
+        "target_search_depth": search_depth,
+        "search_depth": search_depth,
+        "candidate_node_id": candidate_node_id,
+        "node_id": candidate_node_id,
+    }
 
 
 def resolve_candidate_operator_ids(item: Dict[str, Any], max_candidates: int) -> List[str]:
@@ -718,6 +858,7 @@ def make_passthrough_record(item: Dict[str, Any]) -> Dict[str, Any]:
 def make_passthrough_candidate_record(item: Dict[str, Any], requested_candidates: int) -> Dict[str, Any]:
     result = make_passthrough_record(item)
     group_id = get_candidate_group_id(item)
+    context = _search_generation_context(item, operator_id=None, candidate_index=0)
     result["candidate_group_id"] = group_id
     result["candidate_id"] = f"{group_id}::pass_through"
     result["candidate_generation"] = {
@@ -725,6 +866,7 @@ def make_passthrough_candidate_record(item: Dict[str, Any], requested_candidates
         "num_candidates_requested": requested_candidates,
         "operator_id": None,
         "operator_source": "pass_through",
+        **context,
     }
     return result
 
@@ -876,7 +1018,16 @@ def enrich_evolution_result_with_operator(
     return enriched
 
 
-def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rate: Optional[float], model: str) -> Dict[str, Any]:
+def make_evolved_record(
+    item: Dict[str, Any],
+    evolved: Dict[str, Any],
+    score_rate: Optional[float],
+    model: str,
+    *,
+    operator_id: Optional[str] = None,
+    candidate_index: Optional[int] = None,
+    requested_candidates: Optional[int] = None,
+) -> Dict[str, Any]:
     """构造进化后的记录。注意：rubric/score_prompt/scoring_result 对已改变 prompt 的题目已失效，移到 meta_info 中保存。"""
     result = dict(item)
     original_prompt = str(item.get("prompt", "")).strip()
@@ -932,6 +1083,19 @@ def make_evolved_record(item: Dict[str, Any], evolved: Dict[str, Any], score_rat
     result["prompt"] = evolved_prompt
     result["meta_info"] = meta_info
     result["question_evolved"] = True
+    if candidate_index is not None and requested_candidates is not None:
+        group_id = get_candidate_group_id(item)
+        context = _search_generation_context(item, operator_id=operator_id, candidate_index=candidate_index)
+        result["candidate_group_id"] = group_id
+        result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
+        result["candidate_operator"] = operator_id or evolved.get("operator_used")
+        result["candidate_generation"] = {
+            "candidate_index": candidate_index,
+            "num_candidates_requested": requested_candidates,
+            "operator_id": operator_id,
+            "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
+            **context,
+        }
     return result
 
 
@@ -947,6 +1111,7 @@ def make_evolved_candidate_record(
 ) -> Dict[str, Any]:
     result = make_evolved_record(item, evolved, score_rate, model)
     group_id = get_candidate_group_id(item)
+    context = _search_generation_context(item, operator_id=operator_id, candidate_index=candidate_index)
     result["candidate_group_id"] = group_id
     result["candidate_id"] = f"{group_id}::cand_{candidate_index}"
     result["candidate_operator"] = operator_id or evolved.get("operator_used")
@@ -955,6 +1120,7 @@ def make_evolved_candidate_record(
         "num_candidates_requested": requested_candidates,
         "operator_id": operator_id,
         "operator_source": "primary" if candidate_index == 1 else f"backup_{candidate_index - 1}",
+        **context,
     }
     return result
 
@@ -1088,8 +1254,17 @@ class QuestionEvolutionProcessor:
                 return make_passthrough_record(item)
 
             score_rate = get_score_rate(item)
-            evolved = await self.evolve_with_retry(item)
-            return make_evolved_record(item, evolved, score_rate, self.model)
+            operator_id = resolve_operator_id(item) if uses_stage_action_contract(item) else None
+            evolved = await self.evolve_with_retry(item, operator_id=operator_id)
+            return make_evolved_record(
+                item,
+                evolved,
+                score_rate,
+                self.model,
+                operator_id=operator_id or evolved.get("operator_used"),
+                candidate_index=1,
+                requested_candidates=1,
+            )
 
     async def process_item_candidates(
         self,

@@ -43,6 +43,104 @@
         "type": "string"
       }
     },
+    "search_root_id": {
+      "type": "string"
+    },
+    "current_node_id": {
+      "type": "string"
+    },
+    "parent_node_id": {
+      "type": ["string", "null"]
+    },
+    "branch_id": {
+      "type": ["string", "null"]
+    },
+    "branch_action": {
+      "enum": [
+        "expand_current_branch",
+        "fork_from_parent",
+        "fork_from_root",
+        "stop_branch",
+        "stop_sample"
+      ]
+    },
+    "boundary_axis": {
+      "type": ["string", "null"]
+    },
+    "branch_status": {
+      "type": "string"
+    },
+    "search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "source_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "target_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_search_depth": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_sample_branches": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_sample_boundaries": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_sample_candidates_total": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "branch_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_budget_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sample_candidates_used": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "branch_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "discovered_boundaries": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "explored_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recommended_next_axes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "node_prompts": {
+      "type": "object"
+    },
+    "node_records": {
+      "type": "object"
+    },
+    "sample_stop_status": {
+      "type": "string"
+    },
     "stop_status": {
       "enum": [
         "continue",
@@ -51,7 +149,10 @@
         "unanswerable_or_trap_sample",
         "stable_high_score_stop",
         "continue_with_new_operator",
-        "local_tree_search_needed"
+        "local_tree_search_needed",
+        "validated_high_score_sample",
+        "max_boundaries_reached",
+        "budget_exhausted"
       ]
     }
   }

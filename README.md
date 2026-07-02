@@ -7,16 +7,14 @@
 ---
 
 ## 1. 整体流程
-'''
-后续优化：
-1. 当前项目已经实现了“链式主流程 + 单轮局部多候选探索 + 候选选优”，这可以算局部树状探索的第一版；但还没有实现“多层树展开、节点回溯、分支持续搜索”的完整树搜索。
-2. 当前项目是“只要系统判断这个样本已经形成有效边界，或者不值得再进化，就停止继续改题；停止之后，会以透传方式进入下一轮，并复用上一轮评分结果”。进一步优化方向：docs/树状搜索与回溯式多边界探索改造方案.md
-'''
-当前推荐主流程由 `run_loop.sh` 编排，入口是已完成准入的
-`data.jsonl`。脚本仍保留旧输入回退，但正式实验应显式使用准入样本。
+
+当前主流程仍默认保持原来的链式多轮 question evolution；在此基础上，已新增可选的第一版“树搜索 + 回溯式多边界探索”模式。树搜索模式由 `ENABLE_TREE_SEARCH=true` 显式开启，会维护 `active_frontier.jsonl` / `next_frontier.jsonl`，并输出累计 `search_graph.jsonl` 与 `discovered_boundaries.jsonl`，用于从同一个原始样本中探索多个不同能力轴边界。不开启该开关时，旧 11 步循环行为保持不变。
+
+当前推荐主流程由 `run_loop.sh` 编排，默认入口是
+`data/data.jsonl`。如需使用其他输入，可通过 `INPUT_FILE` 覆盖。
 
 ```text
-Stage 0: data.jsonl
+Stage 0: data/data.jsonl
 Stage 1: scoring.py -> round_0/scored.jsonl
 Stage 2: profile_samples.py -> select_evolution_candidates.py
 Stage 3: operator_router.py -> question_evolution.py
@@ -42,12 +40,20 @@ Stage 5: collect_answers.py -> gen_rubric.py -> scoring.py
 | 10 | `analyze_evolution_effect.py` | `effect_analysis.jsonl`, `effect_matrix.jsonl` |
 | 11 | `update_sample_state.py` | `state_updated.jsonl`, memory bank |
 
+启用树搜索时，每轮会在 11 步主链外额外执行：
+
+| 步骤 | 脚本 | 产物 |
+| --- | --- | --- |
+| 0a | `frontier_scheduler.py --mode active` | `active_frontier.jsonl` |
+| 12 | `build_search_graph.py` | 本轮与累计 `search_graph.jsonl`、`discovered_boundaries.jsonl` |
+| 13 | `frontier_scheduler.py --mode schedule` | `next_frontier.jsonl` |
+
 `question_evolution.py` 的 legacy 单脚本路径仍可用于兼容旧数据或局部调试，但不再是推荐主流程。推荐路径必须经过画像、分流、路由、复杂度/可回答性校验、候选选择、效果统计和状态更新。
 
 ### 流程图
 ```text
 Stage 0 输入
-  data.jsonl
+  data/data.jsonl
         |
         v
 Round 0 baseline
@@ -152,6 +158,9 @@ Round N 输入
 | `gen_rubric.py` | 根据题目和参考答案生成 rubric 与 score_prompt | `*_with_answers.jsonl` | `*_rubric.jsonl` |
 | `analyze_evolution_effect.py` | 统计轻量边界命中和 operator 效果矩阵 | `*_scored.jsonl` | `effect_analysis.jsonl` |
 | `update_sample_state.py` | 更新跨轮状态并写入三类 memory bank | `effect_analysis.jsonl` | `state_updated.jsonl` |
+| `search_state.py` | 树搜索 ID、预算、边界签名和 axis 解析工具 | 各阶段记录 | 搜索状态字段 |
+| `frontier_scheduler.py` | 生成 active frontier，并根据效果调度 parent/root 回溯 | `state_updated.jsonl` | `active_frontier.jsonl`, `next_frontier.jsonl` |
+| `build_search_graph.py` | 汇总搜索节点和已发现边界 | `state_updated.jsonl` | `search_graph.jsonl`, `discovered_boundaries.jsonl` |
 
 ---
 
@@ -161,7 +170,7 @@ Round N 输入
 
 ### 2.1 阶段 0：原始数据
 
-推荐入口是 `admitted_seed_samples.jsonl`，每行至少包含：
+默认入口是 `data/data.jsonl`，每行至少包含：
 
 ```json
 {
@@ -477,13 +486,14 @@ bash run_loop.sh
 - 每轮触发进化的阈值：`MIN_SCORE_RATE=0.8`
 - 每条样本最多候选：`NUM_CANDIDATES=2`
 - 单轮候选总预算：`MAX_CANDIDATE_BUDGET=0`，表示自动使用待进化样本数 × 2
+- 树搜索模式默认关闭：`ENABLE_TREE_SEARCH=false`
 
 每轮结果保存在 `experiments/YYYY-MM-DD/exp*/round_N/` 子文件夹中：
 
 ```text
 experiments/YYYY-MM-DD/exp/
 ├── round_0/
-│   ├── input.jsonl       # 初始输入（从 admitted_seed_samples.jsonl 复制）
+│   ├── input.jsonl       # 初始输入（从 data/data.jsonl 复制）
 │   └── scored.jsonl      # 初始 baseline 评分结果
 ├── round_1/
 │   ├── input.jsonl
@@ -510,6 +520,40 @@ experiments/YYYY-MM-DD/exp/
     └── final_scored.jsonl
 ```
 
+#### 启用树搜索 / 回溯探索
+
+树搜索模式适合小样本离线验证或低并发真实验证。开启后，Round N 的输入会先转换为 `active_frontier.jsonl`，每轮结束再由 `next_frontier.jsonl` 决定下一轮待扩展节点：
+
+```bash
+ENABLE_TREE_SEARCH=true \
+MAX_SAMPLE_BRANCHES=2 \
+MAX_SAMPLE_DEPTH=2 \
+MAX_SAMPLE_BOUNDARIES=2 \
+MAX_SAMPLE_CANDIDATES_TOTAL=4 \
+EARLY_STOP_RATE=-999 \
+bash run_loop.sh
+```
+
+树搜索默认预算是 `MAX_SAMPLE_BRANCHES=3`、`MAX_SAMPLE_DEPTH=2`、`MAX_SAMPLE_BOUNDARIES=2`、`MAX_SAMPLE_CANDIDATES_TOTAL=6`。第一版重点是用受控预算探索多个能力轴边界：命中一个有效边界后，调度器优先 `fork_from_parent` 开兄弟分支；不适合时再 `fork_from_root`；预算耗尽或达到边界数上限后停止该 sample。
+
+开启后会额外生成：
+
+```text
+experiments/YYYY-MM-DD/exp*/
+├── search_graph.jsonl
+├── discovered_boundaries.jsonl
+├── round_N/
+│   ├── active_frontier.jsonl
+│   ├── search_graph.jsonl
+│   ├── discovered_boundaries.jsonl
+│   └── next_frontier.jsonl
+└── final/
+    ├── final_scored.jsonl
+    ├── final_frontier.jsonl        # 若最后一轮仍有待扩展 frontier
+    ├── search_graph.jsonl
+    └── discovered_boundaries.jsonl
+```
+
 `run_loop.sh` 会自动生成 `exp/summary.txt`，方便你观察得分率下降趋势：
 
 ```text
@@ -533,6 +577,11 @@ MIN_SCORE_RATE=0.8
 NUM_CANDIDATES=2
 MAX_CANDIDATE_BUDGET=0
 VALIDATION_RETRIES=1
+ENABLE_TREE_SEARCH=false
+MAX_SAMPLE_BRANCHES=3
+MAX_SAMPLE_DEPTH=2
+MAX_SAMPLE_BOUNDARIES=2
+MAX_SAMPLE_CANDIDATES_TOTAL=6
 ```
 
 ### 4.3 分步运行
@@ -540,7 +589,7 @@ VALIDATION_RETRIES=1
 ```bash
 # Round 0：baseline 评分
 python scoring.py \
-  --input admitted_seed_samples.jsonl \
+  --input data/data.jsonl \
   --output round_0_scored.jsonl \
   --answer-mode llm \
   --answer-base-url "$QWEN_BASE_URL" \

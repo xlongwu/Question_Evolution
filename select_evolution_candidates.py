@@ -49,6 +49,8 @@ STOP_STATUSES = {
     "unanswerable_or_trap_sample",
     "stop_evolution",
 }
+TREE_BRANCH_ACTIONS = {"expand_current_branch", "fork_from_parent", "fork_from_root"}
+TREE_TERMINAL_SAMPLE_STATUSES = {"max_boundaries_reached", "budget_exhausted", "stop_sample"}
 
 
 def load_json_or_jsonl(input_path: str) -> List[Dict[str, Any]]:
@@ -81,6 +83,85 @@ def coerce_score_rate(value: Any) -> Optional[float]:
     if 0 <= score_rate <= 1:
         return score_rate
     return None
+
+
+def _clean_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _state(item: Dict[str, Any]) -> Dict[str, Any]:
+    state = item.get("evolution_state")
+    return state if isinstance(state, dict) else {}
+
+
+def _coerce_nonnegative_int(value: Any) -> Optional[int]:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def _first_int(*values: Any) -> Optional[int]:
+    for value in values:
+        number = _coerce_nonnegative_int(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _budget_remaining_allows(item: Dict[str, Any], field: str) -> bool:
+    state = _state(item)
+    remaining = _first_int(item.get(field), state.get(field))
+    return remaining is None or remaining > 0
+
+
+def _scheduled_tree_frontier_requires_evolution(item: Dict[str, Any]) -> bool:
+    state = _state(item)
+    branch_action = _clean_text(item.get("branch_action") or state.get("branch_action"))
+    if branch_action not in TREE_BRANCH_ACTIONS:
+        return False
+
+    sample_stop_status = _clean_text(item.get("sample_stop_status") or state.get("sample_stop_status"))
+    if sample_stop_status != "continue_branch_search":
+        return False
+    if sample_stop_status in TREE_TERMINAL_SAMPLE_STATUSES:
+        return False
+
+    source_depth = _first_int(
+        item.get("source_search_depth"),
+        item.get("search_depth"),
+        state.get("source_search_depth"),
+        state.get("search_depth"),
+    )
+    target_depth = _first_int(item.get("target_search_depth"), state.get("target_search_depth"))
+    if source_depth is None or target_depth is None or target_depth <= source_depth:
+        return False
+    max_depth = _first_int(item.get("max_search_depth"), state.get("max_search_depth"))
+    if max_depth is not None and target_depth > max_depth:
+        return False
+
+    if not _budget_remaining_allows(item, "sample_budget_remaining"):
+        return False
+    if branch_action == "expand_current_branch" and not _budget_remaining_allows(item, "branch_budget_remaining"):
+        return False
+    return True
+
+
+def _scheduled_tree_frontier_action(
+    item: Dict[str, Any],
+    score_rate: Optional[float],
+    *,
+    low_score_threshold: float,
+) -> str:
+    current_action = _clean_text(item.get("evolution_action"))
+    if current_action in {EVOLVE_HIGH_SCORE_OVERSCORE, RECONSTRUCT_LOW_SCORE_BOUNDARY}:
+        return current_action
+
+    diagnosis_text = _joined_diagnosis_text(item)
+    if score_rate is not None and score_rate <= low_score_threshold and _has_any_term(diagnosis_text, LOW_SCORE_BOUNDARY_TERMS):
+        return RECONSTRUCT_LOW_SCORE_BOUNDARY
+    return EVOLVE_HIGH_SCORE_OVERSCORE
 
 
 def get_score_rate(item: Dict[str, Any]) -> Optional[float]:
@@ -147,6 +228,14 @@ def decide_evolution_action(
     score_rate = get_score_rate(item)
     diagnosis_text = _joined_diagnosis_text(item)
     stop_status = _stop_status(item)
+
+    if _scheduled_tree_frontier_requires_evolution(item):
+        action = _scheduled_tree_frontier_action(
+            item,
+            score_rate,
+            low_score_threshold=low_score_threshold,
+        )
+        return action, "scheduled tree-search frontier requires branch expansion; profile stop diagnosis is ignored."
 
     if stop_status in STOP_STATUSES:
         return STOP_EVOLUTION, f"evolution_state.stop_status={stop_status} indicates a terminal state."
